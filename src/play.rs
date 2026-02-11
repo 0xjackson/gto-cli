@@ -325,6 +325,44 @@ fn prompt(message: &str, default: Option<&str>, reader: &mut dyn BufRead, writer
     }
 }
 
+/// Show a numbered menu and return the chosen option string.
+/// `options` is the list of choices. `default_idx` is the 0-based index
+/// highlighted as default (chosen on empty input).
+fn prompt_menu(
+    title: &str,
+    options: &[&str],
+    default_idx: usize,
+    reader: &mut dyn BufRead,
+    writer: &mut dyn Write,
+) -> String {
+    writeln!(writer, "\n  {}:", title.bold()).ok();
+    for (i, opt) in options.iter().enumerate() {
+        if i == default_idx {
+            writeln!(writer, "    {}  {} {}", format!("{})", i + 1).bold(), opt, "(default)".dimmed()).ok();
+        } else {
+            writeln!(writer, "    {}  {}", format!("{})", i + 1).bold(), opt).ok();
+        }
+    }
+    let answer = prompt("  Enter", Some(&format!("{}", default_idx + 1)), reader, writer);
+    if answer.to_lowercase() == "q" {
+        return "q".to_string();
+    }
+    // First: check if the raw text matches any option (exact or prefix)
+    let lower = answer.to_lowercase();
+    for opt in options {
+        if opt.to_lowercase() == lower || opt.to_lowercase().starts_with(&lower) {
+            return opt.to_string();
+        }
+    }
+    // Then: try parsing as a menu number
+    if let Ok(n) = answer.parse::<usize>() {
+        if n >= 1 && n <= options.len() {
+            return options[n - 1].to_string();
+        }
+    }
+    options[default_idx].to_string()
+}
+
 fn prompt_yn(message: &str, default: &str, reader: &mut dyn BufRead, writer: &mut dyn Write) -> Option<bool> {
     let answer = prompt(&format!("{} (y/n)", message), Some(default), reader, writer);
     if answer.to_lowercase() == "q" {
@@ -402,23 +440,20 @@ pub fn run_interactive_session(reader: &mut dyn BufRead, writer: &mut dyn Write)
     writeln!(writer, "Type {} at any prompt to quit.\n", "'q'".bold()).ok();
 
     // -- Game Setup --
-    let table_size_input = prompt("Table size? (6max / 9max)", Some("6max"), reader, writer);
+    let table_size_input = prompt_menu("Table size", &["6max", "9max"], 0, reader, writer);
     if table_size_input.to_lowercase() == "q" {
         return;
     }
-    let table_size = match table_size_input.to_lowercase().as_str() {
-        "9max" => "9max",
-        _ => "6max",
-    };
+    let table_size = if table_size_input.contains("9") { "9max" } else { "6max" };
 
-    let blinds_str = prompt("Blinds? (e.g. 1/2 or 5/10)", Some("1/2"), reader, writer);
-    if blinds_str.to_lowercase() == "q" {
+    let blinds_input = prompt_menu("Blinds", &["1/2", "2/5", "5/10", "25/50"], 0, reader, writer);
+    if blinds_input.to_lowercase() == "q" {
         return;
     }
-    let (sb_amount, bb_amount) = parse_blinds(&blinds_str).unwrap_or((1.0, 2.0));
+    let (sb_amount, bb_amount) = parse_blinds(&blinds_input).unwrap_or((1.0, 2.0));
 
     let default_stack = format!("{}", (bb_amount * 100.0) as u64);
-    let stack_str = prompt("Your stack?", Some(&default_stack), reader, writer);
+    let stack_str = prompt(&format!("  Stack size in $ (100bb = ${})", default_stack), Some(&default_stack), reader, writer);
     if stack_str.to_lowercase() == "q" {
         return;
     }
@@ -464,15 +499,10 @@ fn play_one_hand(
     writer: &mut dyn Write,
 ) -> Result<(), QuitSession> {
     let valid_positions = positions_for(table_size);
-    let positions_display = valid_positions.join(" / ");
 
     // -- Position --
-    let pos_str = prompt(
-        &format!("Your position? ({})", positions_display),
-        Some("BTN"),
-        reader,
-        writer,
-    );
+    let default_btn_idx = valid_positions.iter().position(|&p| p == "BTN").unwrap_or(0);
+    let pos_str = prompt_menu("Your position", valid_positions, default_btn_idx, reader, writer);
     if pos_str.to_lowercase() == "q" {
         return Err(QuitSession);
     }
@@ -486,22 +516,30 @@ fn play_one_hand(
 
     writeln!(writer, "  {}", explain_position(&hero_pos).dimmed()).ok();
 
-    let players_str = prompt("Players in the hand?", Some("2"), reader, writer);
-    if players_str.to_lowercase() == "q" {
+    let players_choice = prompt_menu("Players in the hand", &["2 (heads-up)", "3", "4", "5+"], 0, reader, writer);
+    if players_choice.to_lowercase() == "q" {
         return Err(QuitSession);
     }
-    let num_players: usize = players_str.parse().unwrap_or(2).max(2);
+    let num_players: usize = players_choice.chars()
+        .find(|c| c.is_ascii_digit())
+        .and_then(|c| c.to_digit(10))
+        .map(|n| (n as usize).max(2))
+        .unwrap_or(2);
 
     // -- Hole cards --
+    writeln!(writer, "\n  {} Rank + Suit: {}=spades {}=hearts {}=diamonds {}=clubs",
+        "Card format:".bold(), "s".bold(), "h".bold(), "d".bold(), "c".bold()).ok();
+    writeln!(writer, "  {} AhKs = Ace of hearts, King of spades",
+        "Example:".dimmed()).ok();
     let hole_cards = loop {
-        let cards_str = prompt("Your cards? (e.g. AhKs)", None, reader, writer);
+        let cards_str = prompt("  Your two cards", None, reader, writer);
         if cards_str.to_lowercase() == "q" {
             return Err(QuitSession);
         }
         if let Some(cards) = parse_hole_cards(&cards_str) {
             break cards;
         }
-        writeln!(writer, "  {}", "Invalid cards. Use format like AhKs, Td9c, 7s7h".red()).ok();
+        writeln!(writer, "  {}", "Invalid. Try again like: AhKs, Td9c, 7s7h".red()).ok();
     };
 
     let hand_name = simplify_hand(&hole_cards).unwrap_or_else(|_| "??".to_string());
@@ -518,12 +556,7 @@ fn play_one_hand(
     let mut villain_pos: Option<String> = None;
 
     if raised {
-        let vp = prompt(
-            &format!("Which position raised? ({})", positions_display),
-            None,
-            reader,
-            writer,
-        );
+        let vp = prompt_menu("Which position raised?", valid_positions, 0, reader, writer);
         if vp.to_lowercase() == "q" {
             return Err(QuitSession);
         }
@@ -904,9 +937,10 @@ fn update_pot_after_action(
     reader: &mut dyn BufRead,
     writer: &mut dyn Write,
 ) -> Option<(f64, f64)> {
-    let action = prompt(
-        "What happened? (bet/check/call/fold/allin)",
-        Some("bet"),
+    let action = prompt_menu(
+        "What happened?",
+        &["Bet/Raise", "Check", "Call", "Fold", "All-in"],
+        0,
         reader,
         writer,
     );
@@ -914,13 +948,28 @@ fn update_pot_after_action(
         return None;
     }
 
-    match action.to_lowercase().trim() {
-        "check" | "x" => Some((pot, stack)),
+    let action_lower = action.to_lowercase();
+    let action_key = if action_lower.starts_with("bet") || action_lower.starts_with("raise") {
+        "bet"
+    } else if action_lower.starts_with("check") {
+        "check"
+    } else if action_lower.starts_with("call") {
+        "call"
+    } else if action_lower.starts_with("fold") {
+        "fold"
+    } else if action_lower.starts_with("all") {
+        "allin"
+    } else {
+        "check"
+    };
+
+    match action_key {
+        "check" => Some((pot, stack)),
         "fold" => Some((pot, stack)),
         "allin" => Some((pot + stack * 2.0, 0.0)),
-        "bet" | "raise" => {
+        "bet" => {
             let default_bet = format!("{}", (pot * 0.5) as u64);
-            let amount_str = prompt("Bet/raise amount?", Some(&default_bet), reader, writer);
+            let amount_str = prompt(&format!("  Bet/raise amount in $ (pot is ${:.0})", pot), Some(&default_bet), reader, writer);
             if amount_str.to_lowercase() == "q" {
                 return None;
             }
@@ -929,7 +978,7 @@ fn update_pot_after_action(
         }
         "call" => {
             let default_call = format!("{}", (pot * 0.3) as u64);
-            let amount_str = prompt("Call amount?", Some(&default_call), reader, writer);
+            let amount_str = prompt(&format!("  Call amount in $ (pot is ${:.0})", pot), Some(&default_call), reader, writer);
             if amount_str.to_lowercase() == "q" {
                 return None;
             }
