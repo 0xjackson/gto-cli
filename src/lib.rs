@@ -1,8 +1,11 @@
+pub mod card_encoding;
 pub mod cards;
+pub mod cfr;
 pub mod display;
 pub mod equity;
 pub mod error;
 pub mod hand_evaluator;
+pub mod lookup_eval;
 pub mod math_engine;
 pub mod multiway;
 pub mod play;
