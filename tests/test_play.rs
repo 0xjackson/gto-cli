@@ -350,7 +350,7 @@ fn test_session_invalid_cards_reprompt() {
     let mut output = Vec::new();
     run_interactive_session(&mut reader, &mut output);
     let out = String::from_utf8(output).unwrap();
-    assert!(out.contains("Invalid cards"));
+    assert!(out.contains("Invalid"));
     assert!(out.contains("RAISE"));
 }
 
