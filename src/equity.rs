@@ -3,9 +3,10 @@ use std::fmt;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 
-use crate::cards::{hand_combos, Card, ALL_RANKS, ALL_SUITS};
+use crate::card_encoding::{card_to_index, remaining_deck};
+use crate::cards::{hand_combos, Card};
 use crate::error::{GtoError, GtoResult};
-use crate::hand_evaluator::evaluate_hand;
+use crate::lookup_eval::evaluate_fast;
 
 pub struct EquityResult {
     pub win: f64,
@@ -33,15 +34,6 @@ impl fmt::Display for EquityResult {
     }
 }
 
-fn build_remaining_deck(dead: &[Card]) -> Vec<Card> {
-    let dead_set: std::collections::HashSet<Card> = dead.iter().copied().collect();
-    ALL_RANKS
-        .iter()
-        .flat_map(|&r| ALL_SUITS.iter().map(move |&s| Card::new(r, s)))
-        .filter(|c| !dead_set.contains(c))
-        .collect()
-}
-
 pub fn equity_vs_hand(
     hand1: &[Card],
     hand2: &[Card],
@@ -49,16 +41,18 @@ pub fn equity_vs_hand(
     simulations: usize,
 ) -> GtoResult<EquityResult> {
     let board = board.unwrap_or(&[]);
-    let mut dead: Vec<Card> = Vec::new();
-    dead.extend_from_slice(hand1);
-    dead.extend_from_slice(hand2);
-    dead.extend_from_slice(board);
-    let remaining = build_remaining_deck(&dead);
-    let cards_needed = 5 - board.len();
 
-    let board_vec: Vec<Card> = board.to_vec();
-    let h1: Vec<Card> = hand1.to_vec();
-    let h2: Vec<Card> = hand2.to_vec();
+    // Convert everything to u8 indices for the fast path
+    let h1: [u8; 2] = [card_to_index(&hand1[0]), card_to_index(&hand1[1])];
+    let h2: [u8; 2] = [card_to_index(&hand2[0]), card_to_index(&hand2[1])];
+    let board_idx: Vec<u8> = board.iter().map(card_to_index).collect();
+
+    let mut dead = Vec::with_capacity(4 + board.len());
+    dead.extend_from_slice(&h1);
+    dead.extend_from_slice(&h2);
+    dead.extend_from_slice(&board_idx);
+    let remaining = remaining_deck(&dead);
+    let cards_needed = 5 - board_idx.len();
 
     let results: Vec<(u64, u64, u64)> = (0..simulations)
         .into_par_iter()
@@ -66,12 +60,19 @@ pub fn equity_vs_hand(
             let mut rng = rand::thread_rng();
             let mut deck = remaining.clone();
             deck.shuffle(&mut rng);
-            let runout = &deck[..cards_needed];
-            let mut full_board = board_vec.clone();
-            full_board.extend_from_slice(runout);
 
-            let r1 = evaluate_hand(&h1, &full_board).unwrap();
-            let r2 = evaluate_hand(&h2, &full_board).unwrap();
+            // Build 7-card hands directly as [u8; 7]
+            let mut all1 = [0u8; 7];
+            let mut all2 = [0u8; 7];
+            all1[0] = h1[0]; all1[1] = h1[1];
+            all2[0] = h2[0]; all2[1] = h2[1];
+            for (i, &c) in board_idx.iter().chain(deck[..cards_needed].iter()).enumerate() {
+                all1[2 + i] = c;
+                all2[2 + i] = c;
+            }
+
+            let r1 = evaluate_fast(&all1);
+            let r2 = evaluate_fast(&all2);
 
             match r1.cmp(&r2) {
                 std::cmp::Ordering::Greater => (1, 0, 0),
@@ -103,13 +104,19 @@ pub fn equity_vs_range(
     simulations: usize,
 ) -> GtoResult<EquityResult> {
     let board = board.unwrap_or(&[]);
-    let dead: std::collections::HashSet<Card> = hand.iter().chain(board.iter()).copied().collect();
 
-    let mut all_combos: Vec<Vec<Card>> = Vec::new();
+    let hero: [u8; 2] = [card_to_index(&hand[0]), card_to_index(&hand[1])];
+    let board_idx: Vec<u8> = board.iter().map(card_to_index).collect();
+
+    // Dead cards for filtering combos
+    let dead_set: std::collections::HashSet<Card> = hand.iter().chain(board.iter()).copied().collect();
+
+    // Convert villain combos to u8 index pairs
+    let mut all_combos: Vec<[u8; 2]> = Vec::new();
     for notation in villain_range {
         for (c1, c2) in hand_combos(notation)? {
-            if !dead.contains(&c1) && !dead.contains(&c2) {
-                all_combos.push(vec![c1, c2]);
+            if !dead_set.contains(&c1) && !dead_set.contains(&c2) {
+                all_combos.push([card_to_index(&c1), card_to_index(&c2)]);
             }
         }
     }
@@ -119,18 +126,16 @@ pub fn equity_vs_range(
     }
 
     let sims_per = (simulations / all_combos.len()).max(1);
-    let board_vec: Vec<Card> = board.to_vec();
-    let hero: Vec<Card> = hand.to_vec();
+    let cards_needed = 5 - board_idx.len();
 
     let results: Vec<(u64, u64, u64)> = all_combos
         .par_iter()
-        .map(|villain_hand| {
-            let mut combo_dead: Vec<Card> = Vec::new();
-            combo_dead.extend_from_slice(&hero);
-            combo_dead.extend_from_slice(&board_vec);
-            combo_dead.extend_from_slice(villain_hand);
-            let remaining = build_remaining_deck(&combo_dead);
-            let cards_needed = 5 - board_vec.len();
+        .map(|villain| {
+            let mut dead = Vec::with_capacity(4 + board_idx.len());
+            dead.extend_from_slice(&hero);
+            dead.extend_from_slice(&board_idx);
+            dead.extend_from_slice(villain);
+            let remaining = remaining_deck(&dead);
 
             let mut wins = 0u64;
             let mut ties = 0u64;
@@ -140,12 +145,18 @@ pub fn equity_vs_range(
             for _ in 0..sims_per {
                 let mut deck = remaining.clone();
                 deck.shuffle(&mut rng);
-                let runout = &deck[..cards_needed];
-                let mut full_board = board_vec.clone();
-                full_board.extend_from_slice(runout);
 
-                let r1 = evaluate_hand(&hero, &full_board).unwrap();
-                let r2 = evaluate_hand(villain_hand, &full_board).unwrap();
+                let mut all1 = [0u8; 7];
+                let mut all2 = [0u8; 7];
+                all1[0] = hero[0]; all1[1] = hero[1];
+                all2[0] = villain[0]; all2[1] = villain[1];
+                for (i, &c) in board_idx.iter().chain(deck[..cards_needed].iter()).enumerate() {
+                    all1[2 + i] = c;
+                    all2[2 + i] = c;
+                }
+
+                let r1 = evaluate_fast(&all1);
+                let r2 = evaluate_fast(&all2);
 
                 match r1.cmp(&r2) {
                     std::cmp::Ordering::Greater => wins += 1,
