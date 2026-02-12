@@ -5,6 +5,7 @@ mod cli;
 mod display;
 mod equity;
 mod error;
+mod game_tree;
 mod hand_evaluator;
 mod lookup_eval;
 mod math_engine;

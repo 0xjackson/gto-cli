@@ -4,6 +4,7 @@ pub mod cfr;
 pub mod display;
 pub mod equity;
 pub mod error;
+pub mod game_tree;
 pub mod hand_evaluator;
 pub mod lookup_eval;
 pub mod math_engine;
