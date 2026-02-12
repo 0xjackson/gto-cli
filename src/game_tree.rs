@@ -673,4 +673,57 @@ mod tests {
         let bb = p.bb_showdown(eq);
         assert!(sb + bb < 0.0, "should be negative-sum with rake");
     }
+
+    #[test]
+    fn solver_converges() {
+        // Run solver at 10bb with low iterations to verify convergence direction.
+        let result = solve_push_fold(10.0, 1000, 0.0);
+
+        // Exploitability should be small after 1000 iterations.
+        assert!(
+            result.exploitability < 0.5,
+            "exploitability {} should be < 0.5 bb after 1000 iterations",
+            result.exploitability
+        );
+
+        // AA should always push and always call.
+        let aa = hand_to_bucket("AA").unwrap();
+        assert!(
+            result.push_strategy[aa] > 0.9,
+            "AA push freq {} should be > 0.9",
+            result.push_strategy[aa]
+        );
+        assert!(
+            result.call_strategy[aa] > 0.9,
+            "AA call freq {} should be > 0.9",
+            result.call_strategy[aa]
+        );
+
+        // 72o should almost never push at 10bb.
+        let worst = hand_to_bucket("72o").unwrap();
+        assert!(
+            result.push_strategy[worst] < 0.3,
+            "72o push freq {} should be < 0.3 at 10bb",
+            result.push_strategy[worst]
+        );
+    }
+
+    #[test]
+    fn solver_strategies_valid() {
+        let result = solve_push_fold(10.0, 500, 0.0);
+
+        // All strategies should be valid probabilities.
+        for i in 0..NUM_HANDS {
+            assert!(
+                result.push_strategy[i] >= 0.0 && result.push_strategy[i] <= 1.0,
+                "push_strategy[{}] = {} out of [0,1]",
+                i, result.push_strategy[i]
+            );
+            assert!(
+                result.call_strategy[i] >= 0.0 && result.call_strategy[i] <= 1.0,
+                "call_strategy[{}] = {} out of [0,1]",
+                i, result.call_strategy[i]
+            );
+        }
+    }
 }
