@@ -12,9 +12,11 @@ mod math_engine;
 mod multiway;
 mod play;
 mod postflop;
+mod postflop_tree;
 mod preflop;
 mod preflop_solver;
 mod ranges;
+mod river_solver;
 
 fn main() {
     cli::run();
