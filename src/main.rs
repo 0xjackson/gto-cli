@@ -1,3 +1,4 @@
+mod bucketing;
 mod card_encoding;
 mod cards;
 mod cfr;
@@ -6,6 +7,7 @@ mod display;
 mod equity;
 mod error;
 mod flat_cfr;
+mod flop_solver;
 mod game_tree;
 mod hand_evaluator;
 mod lookup_eval;

@@ -16,5 +16,7 @@ pub mod postflop_tree;
 pub mod preflop;
 pub mod preflop_solver;
 pub mod ranges;
+pub mod bucketing;
+pub mod flop_solver;
 pub mod river_solver;
 pub mod turn_solver;

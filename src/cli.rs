@@ -320,6 +320,27 @@ enum SolverCommands {
         #[arg(short, long, default_value = "5000")]
         iterations: usize,
     },
+    /// Solve a flop spot using MCCFR (flop + turn + river)
+    Flop {
+        /// Board cards (exactly 3 for flop, e.g., Ks9d4c)
+        #[arg(short, long)]
+        board: String,
+        /// OOP player range (e.g., "AA,AKs,KQs")
+        #[arg(long)]
+        oop: String,
+        /// IP player range (e.g., "QQ,JJ,TT")
+        #[arg(long)]
+        ip: String,
+        /// Starting pot size
+        #[arg(short, long, default_value = "10")]
+        pot: f64,
+        /// Effective stack remaining
+        #[arg(short, long, default_value = "50")]
+        stack: f64,
+        /// Number of MCCFR iterations
+        #[arg(short, long, default_value = "500000")]
+        iterations: usize,
+    },
 }
 
 fn validate_position(pos: &str, table_size: &str) -> Result<String, String> {
@@ -446,6 +467,14 @@ pub fn run() {
                 stack,
                 iterations,
             } => cmd_solve_turn(board, oop, ip, pot, stack, iterations),
+            SolverCommands::Flop {
+                board,
+                oop,
+                ip,
+                pot,
+                stack,
+                iterations,
+            } => cmd_solve_flop(board, oop, ip, pot, stack, iterations),
         },
     }
 }
@@ -1762,6 +1791,37 @@ fn cmd_solve_turn(board: String, oop: String, ip: String, pot: f64, stack: f64, 
     );
 
     let result = solve_turn(&config);
+    result.display();
+    result.save_cache();
+}
+
+fn cmd_solve_flop(board: String, oop: String, ip: String, pot: f64, stack: f64, iterations: usize) {
+    use crate::flop_solver::{FlopSolverConfig, solve_flop};
+
+    if pot <= 0.0 {
+        print_error("Pot must be positive");
+        return;
+    }
+    if stack <= 0.0 {
+        print_error("Stack must be positive");
+        return;
+    }
+
+    let config = match FlopSolverConfig::new(&board, &oop, &ip, pot, stack, iterations) {
+        Ok(c) => c,
+        Err(ref e) => {
+            print_error(e);
+            return;
+        }
+    };
+
+    println!();
+    println!(
+        "  Solving flop: board={}, pot={}, stack={}, {} iterations...",
+        board, pot, stack, iterations
+    );
+
+    let result = solve_flop(&config);
     result.display();
     result.save_cache();
 }
