@@ -234,6 +234,27 @@ enum Commands {
     },
     /// Interactive hand advisor — walk through a poker hand step-by-step
     Play,
+    /// Solve GTO strategies using CFR+
+    Solve {
+        #[command(subcommand)]
+        solver: SolverCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SolverCommands {
+    /// Solve push/fold ranges for a given stack depth
+    Pushfold {
+        /// Stack depth in big blinds
+        #[arg(short, long, default_value = "10")]
+        stack: f64,
+        /// Rake percentage (0-100)
+        #[arg(short, long, default_value = "0")]
+        rake: f64,
+        /// Number of CFR+ iterations (more = more accurate)
+        #[arg(short, long, default_value = "10000")]
+        iterations: usize,
+    },
 }
 
 fn validate_position(pos: &str, table_size: &str) -> Result<String, String> {
@@ -311,6 +332,13 @@ pub fn run() {
         Commands::Combos { range_str } => cmd_combos(range_str),
         Commands::Bluff { pot, bet } => cmd_bluff(pot, bet),
         Commands::Play => crate::play::play_command(),
+        Commands::Solve { solver } => match solver {
+            SolverCommands::Pushfold {
+                stack,
+                rake,
+                iterations,
+            } => cmd_solve_pushfold(stack, rake, iterations),
+        },
     }
 }
 
@@ -1100,4 +1128,26 @@ fn cmd_bluff(pot: f64, bet: f64) {
         format!("{:.1}%", be_pct * 100.0).bold()
     );
     println!();
+}
+
+fn cmd_solve_pushfold(stack: f64, rake: f64, iterations: usize) {
+    use crate::game_tree::solve_push_fold;
+
+    if stack <= 0.0 {
+        print_error("Stack must be positive");
+        return;
+    }
+    if rake < 0.0 || rake > 100.0 {
+        print_error("Rake must be between 0 and 100");
+        return;
+    }
+
+    println!();
+    println!(
+        "  Solving push/fold for {}bb stack, {}% rake, {} iterations...",
+        stack, rake, iterations
+    );
+
+    let result = solve_push_fold(stack, iterations, rake);
+    result.display();
 }
