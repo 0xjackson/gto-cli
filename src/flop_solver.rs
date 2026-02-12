@@ -18,6 +18,7 @@
 //! reduce the info set space.
 
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::bucketing::assign_buckets;
@@ -312,10 +313,98 @@ pub fn solve_flop(config: &FlopSolverConfig) -> FlopSolution {
 
     // Available turn and river cards
     let remaining_after_flop = remaining_deck(&config.board);
+    let num_remaining = remaining_after_flop.len();
+
+    // Build card -> index mapping for remaining cards
+    let mut card_to_remaining_idx = [0usize; 52];
+    for (idx, &card) in remaining_after_flop.iter().enumerate() {
+        card_to_remaining_idx[card as usize] = idx;
+    }
+
+    // 6. Precompute bucket and score lookup tables for all runouts
+    // This eliminates per-iteration assign_buckets() calls (~100x speedup)
+
+    // Precompute turn buckets: turn_bucket_table[turn_idx] = (oop_buckets, ip_buckets)
+    let turn_bucket_table: Vec<(Vec<u16>, Vec<u16>)> = remaining_after_flop
+        .par_iter()
+        .map(|&turn_card| {
+            let turn_board = [config.board[0], config.board[1], config.board[2], turn_card];
+            let turn_oop = assign_buckets(&oop_combo_pairs, &turn_board, config.num_buckets, 200);
+            let turn_ip = assign_buckets(&ip_combo_pairs, &turn_board, config.num_buckets, 200);
+            (turn_oop, turn_ip)
+        })
+        .collect();
+
+    // Precompute river data for all runouts: river_bucket_table and score_table
+    // Indexed by runout_idx = turn_idx * (num_remaining - 1) + adjusted_river_idx
+    let num_runouts = num_remaining * (num_remaining - 1);
+    let river_bucket_table: Vec<(Vec<u16>, Vec<u16>)>;
+    let score_table: Vec<(Vec<u32>, Vec<u32>)>;
+
+    {
+        let results: Vec<((Vec<u16>, Vec<u16>), (Vec<u32>, Vec<u32>))> = (0..num_runouts)
+            .into_par_iter()
+            .map(|runout_idx| {
+                let turn_idx = runout_idx / (num_remaining - 1);
+                let river_adj = runout_idx % (num_remaining - 1);
+                let river_idx = if river_adj >= turn_idx {
+                    river_adj + 1
+                } else {
+                    river_adj
+                };
+                let turn_card = remaining_after_flop[turn_idx];
+                let river_card = remaining_after_flop[river_idx];
+                let river_board = [
+                    config.board[0],
+                    config.board[1],
+                    config.board[2],
+                    turn_card,
+                    river_card,
+                ];
+                let r_oop =
+                    assign_buckets(&oop_combo_pairs, &river_board, config.num_buckets, 0);
+                let r_ip =
+                    assign_buckets(&ip_combo_pairs, &river_board, config.num_buckets, 0);
+                let s_oop: Vec<u32> = oop_combo_pairs
+                    .iter()
+                    .map(|&(c0, c1)| {
+                        evaluate_fast(&[
+                            c0,
+                            c1,
+                            river_board[0],
+                            river_board[1],
+                            river_board[2],
+                            river_board[3],
+                            river_board[4],
+                        ])
+                    })
+                    .collect();
+                let s_ip: Vec<u32> = ip_combo_pairs
+                    .iter()
+                    .map(|&(c0, c1)| {
+                        evaluate_fast(&[
+                            c0,
+                            c1,
+                            river_board[0],
+                            river_board[1],
+                            river_board[2],
+                            river_board[3],
+                            river_board[4],
+                        ])
+                    })
+                    .collect();
+                ((r_oop, r_ip), (s_oop, s_ip))
+            })
+            .collect();
+
+        let (rb, st): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+        river_bucket_table = rb;
+        score_table = st;
+    }
 
     let mut rng = rand::thread_rng();
 
-    // 6. Run MCCFR iterations
+    // 7. Run MCCFR iterations
     for iter in 0..config.iterations {
         let traverser = if iter % 2 == 0 {
             Player::OOP
@@ -324,70 +413,32 @@ pub fn solve_flop(config: &FlopSolverConfig) -> FlopSolution {
         };
 
         // Sample a turn card
-        let turn_card = remaining_after_flop[rng.gen_range(0..remaining_after_flop.len())];
+        let turn_raw_idx = rng.gen_range(0..num_remaining);
+        let turn_card = remaining_after_flop[turn_raw_idx];
 
         // Sample a river card (not the turn card)
-        let mut river_card;
-        loop {
-            river_card = remaining_after_flop[rng.gen_range(0..remaining_after_flop.len())];
-            if river_card != turn_card {
-                break;
+        let river_raw_idx = {
+            let mut ri;
+            loop {
+                ri = rng.gen_range(0..num_remaining);
+                if ri != turn_raw_idx {
+                    break;
+                }
             }
-        }
+            ri
+        };
+        let river_card = remaining_after_flop[river_raw_idx];
 
-        // Build 4-card and 5-card boards
-        let turn_board = [config.board[0], config.board[1], config.board[2], turn_card];
-        let river_board = [
-            config.board[0],
-            config.board[1],
-            config.board[2],
-            turn_card,
-            river_card,
-        ];
-
-        // Compute turn buckets for this sampled card
-        let turn_oop_pairs: Vec<(u8, u8)> = oop_combos.iter().map(|c| (c.0, c.1)).collect();
-        let turn_ip_pairs: Vec<(u8, u8)> = ip_combos.iter().map(|c| (c.0, c.1)).collect();
-        let turn_oop_buckets =
-            assign_buckets(&turn_oop_pairs, &turn_board, config.num_buckets, 200);
-        let turn_ip_buckets =
-            assign_buckets(&turn_ip_pairs, &turn_board, config.num_buckets, 200);
-
-        // Compute river buckets (exhaustive on 5-card board)
-        let river_oop_buckets =
-            assign_buckets(&oop_combo_pairs, &river_board, config.num_buckets, 0);
-        let river_ip_buckets =
-            assign_buckets(&ip_combo_pairs, &river_board, config.num_buckets, 0);
-
-        // Precompute showdown scores for the river
-        let oop_scores: Vec<u32> = oop_combos
-            .iter()
-            .map(|c| {
-                evaluate_fast(&[
-                    c.0,
-                    c.1,
-                    river_board[0],
-                    river_board[1],
-                    river_board[2],
-                    river_board[3],
-                    river_board[4],
-                ])
-            })
-            .collect();
-        let ip_scores: Vec<u32> = ip_combos
-            .iter()
-            .map(|c| {
-                evaluate_fast(&[
-                    c.0,
-                    c.1,
-                    river_board[0],
-                    river_board[1],
-                    river_board[2],
-                    river_board[3],
-                    river_board[4],
-                ])
-            })
-            .collect();
+        // Lookup precomputed buckets and scores
+        let (turn_oop_buckets, turn_ip_buckets) = &turn_bucket_table[turn_raw_idx];
+        let runout_idx = turn_raw_idx * (num_remaining - 1)
+            + if river_raw_idx > turn_raw_idx {
+                river_raw_idx - 1
+            } else {
+                river_raw_idx
+            };
+        let (river_oop_buckets, river_ip_buckets) = &river_bucket_table[runout_idx];
+        let (oop_scores, ip_scores) = &score_table[runout_idx];
 
         let num_combos = match traverser {
             Player::OOP => oop_combos.len(),
@@ -417,7 +468,6 @@ pub fn solve_flop(config: &FlopSolverConfig) -> FlopSolution {
                     let mut reach = vec![0.0f64; ip_combos.len()];
                     for &j in valid {
                         let j = j as usize;
-                        // Also zero out opponents blocked by sampled cards
                         if !ip_blockers[j][turn_card as usize]
                             && !ip_blockers[j][river_card as usize]
                         {
@@ -469,12 +519,12 @@ pub fn solve_flop(config: &FlopSolverConfig) -> FlopSolution {
                 &ip_blockers,
                 &flop_oop_buckets,
                 &flop_ip_buckets,
-                &turn_oop_buckets,
-                &turn_ip_buckets,
-                &river_oop_buckets,
-                &river_ip_buckets,
-                &oop_scores,
-                &ip_scores,
+                turn_oop_buckets,
+                turn_ip_buckets,
+                river_oop_buckets,
+                river_ip_buckets,
+                oop_scores,
+                ip_scores,
                 &valid_ip_for_oop,
                 &valid_oop_for_ip,
                 config.starting_pot,
@@ -1238,52 +1288,87 @@ fn estimate_exploitability(
     num_buckets: usize,
 ) -> f64 {
     let remaining = remaining_deck(board);
+    let num_remaining = remaining.len();
     let num_samples = 100;
     let mut rng = rand::thread_rng();
+
+    let oop_pairs: Vec<(u8, u8)> = oop_combos.iter().map(|c| (c.0, c.1)).collect();
+    let ip_pairs: Vec<(u8, u8)> = ip_combos.iter().map(|c| (c.0, c.1)).collect();
+
+    // Precompute turn buckets for exploitability estimation
+    let turn_bucket_table: Vec<(Vec<u16>, Vec<u16>)> = remaining
+        .par_iter()
+        .map(|&turn_card| {
+            let turn_board = [board[0], board[1], board[2], turn_card];
+            let t_oop = assign_buckets(&oop_pairs, &turn_board, num_buckets, 200);
+            let t_ip = assign_buckets(&ip_pairs, &turn_board, num_buckets, 200);
+            (t_oop, t_ip)
+        })
+        .collect();
+
+    // Precompute river data for exploitability estimation
+    let num_runouts = num_remaining * (num_remaining - 1);
+    let river_data: Vec<((Vec<u16>, Vec<u16>), (Vec<u32>, Vec<u32>))> = (0..num_runouts)
+        .into_par_iter()
+        .map(|runout_idx| {
+            let turn_idx = runout_idx / (num_remaining - 1);
+            let river_adj = runout_idx % (num_remaining - 1);
+            let river_idx = if river_adj >= turn_idx {
+                river_adj + 1
+            } else {
+                river_adj
+            };
+            let turn_card = remaining[turn_idx];
+            let river_card = remaining[river_idx];
+            let river_board = [board[0], board[1], board[2], turn_card, river_card];
+            let r_oop = assign_buckets(&oop_pairs, &river_board, num_buckets, 0);
+            let r_ip = assign_buckets(&ip_pairs, &river_board, num_buckets, 0);
+            let s_oop: Vec<u32> = oop_pairs
+                .iter()
+                .map(|&(c0, c1)| {
+                    evaluate_fast(&[
+                        c0, c1, river_board[0], river_board[1], river_board[2],
+                        river_board[3], river_board[4],
+                    ])
+                })
+                .collect();
+            let s_ip: Vec<u32> = ip_pairs
+                .iter()
+                .map(|&(c0, c1)| {
+                    evaluate_fast(&[
+                        c0, c1, river_board[0], river_board[1], river_board[2],
+                        river_board[3], river_board[4],
+                    ])
+                })
+                .collect();
+            ((r_oop, r_ip), (s_oop, s_ip))
+        })
+        .collect();
 
     let mut oop_total_gain = 0.0;
     let mut ip_total_gain = 0.0;
     let mut sample_count = 0;
 
     for _ in 0..num_samples {
-        let turn_card = remaining[rng.gen_range(0..remaining.len())];
-        let mut river_card;
-        loop {
-            river_card = remaining[rng.gen_range(0..remaining.len())];
-            if river_card != turn_card {
-                break;
+        let turn_raw_idx = rng.gen_range(0..num_remaining);
+        let turn_card = remaining[turn_raw_idx];
+        let river_raw_idx = loop {
+            let ri = rng.gen_range(0..num_remaining);
+            if ri != turn_raw_idx {
+                break ri;
             }
-        }
+        };
+        let river_card = remaining[river_raw_idx];
 
-        let turn_board = [board[0], board[1], board[2], turn_card];
-        let river_board = [board[0], board[1], board[2], turn_card, river_card];
-
-        let oop_pairs: Vec<(u8, u8)> = oop_combos.iter().map(|c| (c.0, c.1)).collect();
-        let ip_pairs: Vec<(u8, u8)> = ip_combos.iter().map(|c| (c.0, c.1)).collect();
-
-        let turn_oop_buckets = assign_buckets(&oop_pairs, &turn_board, num_buckets, 200);
-        let turn_ip_buckets = assign_buckets(&ip_pairs, &turn_board, num_buckets, 200);
-        let river_oop_buckets = assign_buckets(&oop_pairs, &river_board, num_buckets, 0);
-        let river_ip_buckets = assign_buckets(&ip_pairs, &river_board, num_buckets, 0);
-
-        let oop_scores: Vec<u32> = oop_combos
-            .iter()
-            .map(|c| {
-                evaluate_fast(&[
-                    c.0, c.1, river_board[0], river_board[1], river_board[2], river_board[3],
-                    river_board[4],
-                ])
-            })
-            .collect();
-        let ip_scores: Vec<u32> = ip_combos
-            .iter()
-            .map(|c| {
-                evaluate_fast(&[
-                    c.0, c.1, river_board[0], river_board[1], river_board[2], river_board[3],
-                    river_board[4],
-                ])
-            })
-            .collect();
+        let (turn_oop_buckets, turn_ip_buckets) = &turn_bucket_table[turn_raw_idx];
+        let runout_idx = turn_raw_idx * (num_remaining - 1)
+            + if river_raw_idx > turn_raw_idx {
+                river_raw_idx - 1
+            } else {
+                river_raw_idx
+            };
+        let ((river_oop_buckets, river_ip_buckets), (oop_scores, ip_scores)) =
+            &river_data[runout_idx];
 
         let mut strat_buf = vec![0.0f32; 16];
 
@@ -1308,9 +1393,9 @@ fn estimate_exploitability(
                 flop_tree, Player::OOP, h, flop_bucket, turn_bucket, river_bucket,
                 &opp_reach, oop_combos, ip_combos,
                 flop_oop_buckets, flop_ip_buckets,
-                &turn_oop_buckets, &turn_ip_buckets,
-                &river_oop_buckets, &river_ip_buckets,
-                &oop_scores, &ip_scores, valid_ip_for_oop, valid_oop_for_ip,
+                turn_oop_buckets, turn_ip_buckets,
+                river_oop_buckets, river_ip_buckets,
+                oop_scores, ip_scores, valid_ip_for_oop, valid_oop_for_ip,
                 starting_pot, turn_template, river_template,
                 flop_oop_cfr, flop_ip_cfr, turn_oop_cfr, turn_ip_cfr,
                 river_oop_cfr, river_ip_cfr, &mut strat_buf, true,
@@ -1319,9 +1404,9 @@ fn estimate_exploitability(
                 flop_tree, Player::OOP, h, flop_bucket, turn_bucket, river_bucket,
                 &opp_reach, oop_combos, ip_combos,
                 flop_oop_buckets, flop_ip_buckets,
-                &turn_oop_buckets, &turn_ip_buckets,
-                &river_oop_buckets, &river_ip_buckets,
-                &oop_scores, &ip_scores, valid_ip_for_oop, valid_oop_for_ip,
+                turn_oop_buckets, turn_ip_buckets,
+                river_oop_buckets, river_ip_buckets,
+                oop_scores, ip_scores, valid_ip_for_oop, valid_oop_for_ip,
                 starting_pot, turn_template, river_template,
                 flop_oop_cfr, flop_ip_cfr, turn_oop_cfr, turn_ip_cfr,
                 river_oop_cfr, river_ip_cfr, &mut strat_buf, false,
@@ -1351,9 +1436,9 @@ fn estimate_exploitability(
                 flop_tree, Player::IP, h, flop_bucket, turn_bucket, river_bucket,
                 &opp_reach, oop_combos, ip_combos,
                 flop_oop_buckets, flop_ip_buckets,
-                &turn_oop_buckets, &turn_ip_buckets,
-                &river_oop_buckets, &river_ip_buckets,
-                &oop_scores, &ip_scores, valid_ip_for_oop, valid_oop_for_ip,
+                turn_oop_buckets, turn_ip_buckets,
+                river_oop_buckets, river_ip_buckets,
+                oop_scores, ip_scores, valid_ip_for_oop, valid_oop_for_ip,
                 starting_pot, turn_template, river_template,
                 flop_oop_cfr, flop_ip_cfr, turn_oop_cfr, turn_ip_cfr,
                 river_oop_cfr, river_ip_cfr, &mut strat_buf, true,
@@ -1362,9 +1447,9 @@ fn estimate_exploitability(
                 flop_tree, Player::IP, h, flop_bucket, turn_bucket, river_bucket,
                 &opp_reach, oop_combos, ip_combos,
                 flop_oop_buckets, flop_ip_buckets,
-                &turn_oop_buckets, &turn_ip_buckets,
-                &river_oop_buckets, &river_ip_buckets,
-                &oop_scores, &ip_scores, valid_ip_for_oop, valid_oop_for_ip,
+                turn_oop_buckets, turn_ip_buckets,
+                river_oop_buckets, river_ip_buckets,
+                oop_scores, ip_scores, valid_ip_for_oop, valid_oop_for_ip,
                 starting_pot, turn_template, river_template,
                 flop_oop_cfr, flop_ip_cfr, turn_oop_cfr, turn_ip_cfr,
                 river_oop_cfr, river_ip_cfr, &mut strat_buf, false,
