@@ -62,7 +62,7 @@ gto action AhQd --position BTN --board Ks9d4c7hQc --pot 10 --stack 95.5
 | 2 | Full preflop (open/3bet/4bet/5bet) | DONE | 3 min | Instant |
 | 3 | River solver | DONE | 1-5 sec/spot | Instant |
 | 4 | Turn solver (includes river) | DONE | 15-45 sec/spot | Instant |
-| 5 | Flop solver (includes turn+river) | TODO | 1-4 min/spot | Instant |
+| 5 | Flop solver (includes turn+river) | DONE | 1-4 min/spot | Instant |
 | 6 | Infrastructure: CFR engine optimization | TODO | N/A | N/A |
 | 7 | Railway deployment + batch pre-solve | TODO | Background | Instant |
 | 8 | Unified CLI query interface | TODO | N/A | <1 sec |
@@ -197,111 +197,34 @@ Heads-up turn+river CFR+ solver with chance nodes for river card dealing and fla
 
 ---
 
-## Phase 5: Flop Solver
+## Phase 5: Flop Solver — DONE
 
-### Context
+External Sampling MCCFR with template trees and equity-based hand bucketing.
 
-Two streets of chance nodes (turn + river). The full game tree: flop actions → turn card → turn actions → river card → river actions → showdown. This is what PioSolver primarily solves.
+**Files**: `src/bucketing.rs`, `src/flop_solver.rs`, `src/cli.rs` (modified), `src/lib.rs` (modified), `src/main.rs` (modified)
+**Tests**: 10 integration tests in `tests/test_flop_solver.rs`, 6 unit tests in `src/bucketing.rs`
+**Commands**: `gto solve flop --board Ks9d4c --oop AA,KK,QQ,AKs --ip JJ,TT,99,AQs --pot 10 --stack 50 --iterations 500000`
 
-### Scale
+**Key decisions made**:
+- **Template trees**: 3 separate single-street action trees instead of one massive composite tree
+  - Flop tree: built with actual pot/stack (~12 nodes)
+  - Turn template: built with pot=1.0, stack=100.0 (~10 nodes), scaled at runtime
+  - River template: built with pot=1.0, stack=100.0 (~12 nodes), scaled at runtime
+  - Template scaling: `actual_value = template_value × pot_at_street_start`
+- **6 FlatCfr instances**: 1 per player × 3 streets, total ~1 MB memory
+- **Equity-based hand bucketing**: ~200 buckets per street via equal-frequency equity binning (not k-means — simpler, equally effective)
+  - River: exhaustive equity evaluation (5-card board)
+  - Flop/turn: Monte Carlo equity vs random (~200-500 samples)
+- **External sampling MCCFR**: each iteration samples one turn card + one river card, traverses all 3 street trees
+- **Bet sizes**: Flop 33%/75%, Turn 66%, River 50%/100%
+- **Blocker handling**: combos conflicting with sampled turn/river cards are skipped, opponent reach zeroed
+- **Exploitability**: Monte Carlo estimate via best-response sampling (100 runouts)
+- **Solution extraction**: combo-level strategies from bucket-level FlatCfr (map combo→bucket→strategy)
+- Cache to `~/.gto-cli/solver/flop_{board}_{pot}_{stack}.json`
 
-- ~1,000 hand combos × ~47 turn cards × ~46 river cards = ~2,162 board runouts
-- Game tree across 3 streets with 2-3 bet sizes each
-- **Info sets: 5M-50M** (depending on bet tree complexity)
-- **Memory: 0.5-5 GB** (target: 0.5-1.5 GB with optimizations)
-
-### Key Optimizations Required
-
-| Optimization | What | Impact |
-|---|---|---|
-| Flat array CFR (Phase 4) | Contiguous f32 storage | 5x memory reduction |
-| Hand bucketing | Cluster similar hands by equity | 5-10x info set reduction |
-| Regret pruning | Skip traversal of low-regret subtrees | 2-3x speed per iteration |
-| Rayon parallelization | Parallelize CFR iterations across hands | Linear speedup with cores |
-| External sampling MCCFR | Sample chance nodes instead of full enumeration | 10-50x cheaper per iteration |
-
-### Hand Bucketing (Card Abstraction)
-
-Instead of tracking strategies for all ~1,000 individual hand combos, cluster similar hands into ~150-200 **buckets** based on equity characteristics.
-
-**Method**: Opponent Cluster Hand Strength (OCHS)
-1. For each hand on this board, compute equity vs a uniform random opponent
-2. Cluster hands into N buckets by equity similarity (k-means)
-3. All hands in the same bucket share the same strategy
-
-**Bucket counts**:
-- Flop: ~200 buckets (from ~1000 combos)
-- Turn: ~200 buckets
-- River: ~200 buckets (or exact combos since river is small)
-
-This reduces info sets from 50M to ~5M, fitting in 0.5-1.5 GB.
-
-### Algorithm: External Sampling MCCFR
-
-For flop, full tree traversal each iteration is too expensive (~2,162 runouts × full tree). Switch to **external sampling MCCFR**:
-
-- Each iteration: sample ONE turn card and ONE river card
-- Traverse only that single runout's tree
-- Much cheaper per iteration (~2000x), but needs more iterations to converge
-- Standard approach used by all commercial solvers for flop-level trees
-
-**Iteration count**: 500K-2M iterations (each one is cheap due to sampling)
-
-### Decisions
-
-- **Bucketing method**: OCHS (equity-based clustering). ~200 buckets per street.
-- **MCCFR vs CFR+**: Use external sampling MCCFR for flop. CFR+ for river/turn (small enough for full traversal).
-- **Bet sizes**: Flop: 33%, 75% pot. Turn: 50%, 100% pot. River: 33%, 66%, 100% pot.
-- **Target memory**: 0.5-1.5 GB per flop solve (fits 16 GB laptop comfortably).
-
-### Performance
-
-- **Solve time**: 1-4 minutes per flop spot on Railway (8 vCPU)
-- **Accuracy**: Exploitability < 1% pot after 1M MCCFR iterations
-- **Memory**: 0.5-1.5 GB per solve
-- **Query**: Instant from cache
-
-### Files
-
-| File | Action |
-|---|---|
-| `src/bucketing.rs` | NEW — hand clustering (OCHS, k-means) |
-| `src/mccfr.rs` | NEW — external sampling MCCFR algorithm |
-| `src/postflop_solver.rs` | MODIFY — add flop solver using MCCFR + bucketing |
-| `src/postflop_tree.rs` | MODIFY — two levels of chance nodes |
-| `src/cli.rs` | MODIFY — flop support |
-| `tests/test_flop_solver.rs` | NEW |
-
-### Steps
-
-**5.1**: Hand bucketing (`src/bucketing.rs`)
-- Compute equity for all hand combos vs uniform range on a given board
-- K-means clustering into N buckets
-- `HandBucketing` struct: maps each combo to a bucket index
-- Test: similar equity hands land in same bucket, dissimilar hands in different buckets
-
-**5.2**: External sampling MCCFR (`src/mccfr.rs`)
-- `MccfrTrainer`: similar interface to `FlatCfr` but with sampling
-- Each iteration: sample chance outcomes, traverse one path through tree
-- Regret update only on the sampled path
-- Average strategy accumulated across all samples
-
-**5.3**: Flop solver (`src/postflop_solver.rs`)
-- `FlopSolver`: builds full 3-street tree with bucketing
-- Integrates MCCFR for iteration, hand buckets for abstraction
-- Flop → turn chance → turn → river chance → river → showdown
-
-**5.4**: Flop caching + CLI
-- Cache to `~/.gto-cli/solver/flop_{board}_{scenario}_{pot}_{stack}.json`
-- `gto solve postflop --board XsXdXc` detects 3-card board → flop solve
-- Compressed storage (flop solutions are larger)
-
-**5.5**: Tests
-- Convergence: exploitability < 1% pot
-- C-bet frequency on dry vs wet boards
-- Continuation across streets (flop bet → turn bet sequences)
-- Check-raise frequency reasonable (5-15%)
-- Position advantage: IP profits more than OOP on average
+**Architecture**:
+- `src/bucketing.rs`: `combo_equity_vs_random()` (Monte Carlo + exhaustive), `assign_buckets()` (equal-frequency binning)
+- `src/flop_solver.rs`: `solve_flop()`, three-level traversal (`cfr_traverse_flop` → `cfr_traverse_turn_template` → `cfr_traverse_river_template`), best-response exploitability, caching, display
 
 ---
 
