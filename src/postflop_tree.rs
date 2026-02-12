@@ -3,6 +3,12 @@
 //! Constructs a recursive action tree for heads-up postflop play with
 //! configurable bet/raise sizes and depth limits. Reusable for river,
 //! turn, and flop solvers.
+//!
+//! For multi-street trees (turn+river), Showdown terminals from the
+//! earlier street are replaced with Chance nodes that branch into the
+//! next street's action subtrees.
+
+use crate::card_encoding::remaining_deck;
 
 /// Which player is acting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +76,18 @@ pub enum TreeNode {
     Terminal {
         terminal_type: TerminalType,
         pot: f64,
+        stacks: [f64; 2],
         invested: [f64; 2],
+    },
+    /// Chance node: deals a card, branches into next-street subtrees.
+    Chance {
+        pot: f64,
+        stacks: [f64; 2],
+        invested: [f64; 2],
+        /// Possible cards to deal (u8 indices, 0-51).
+        cards: Vec<u8>,
+        /// One child subtree per card (same order as `cards`).
+        children: Vec<TreeNode>,
     },
 }
 
@@ -80,6 +97,9 @@ impl TreeNode {
             TreeNode::Action { children, .. } => {
                 1 + children.iter().map(|c| c.count_action_nodes()).sum::<usize>()
             }
+            TreeNode::Chance { children, .. } => {
+                children.iter().map(|c| c.count_action_nodes()).sum()
+            }
             TreeNode::Terminal { .. } => 0,
         }
     }
@@ -87,6 +107,9 @@ impl TreeNode {
     pub fn count_terminal_nodes(&self) -> usize {
         match self {
             TreeNode::Action { children, .. } => {
+                children.iter().map(|c| c.count_terminal_nodes()).sum()
+            }
+            TreeNode::Chance { children, .. } => {
                 children.iter().map(|c| c.count_terminal_nodes()).sum()
             }
             TreeNode::Terminal { .. } => 1,
@@ -119,6 +142,39 @@ impl TreeConfig {
             starting_pot,
             effective_stack,
             add_allin: true,
+        }
+    }
+
+    pub fn default_turn(starting_pot: f64, effective_stack: f64) -> Self {
+        TreeConfig {
+            bet_sizes: vec![0.5, 1.0],
+            raise_sizes: vec![1.0],
+            max_raises: 2,
+            starting_pot,
+            effective_stack,
+            add_allin: true,
+        }
+    }
+}
+
+/// Configuration for a turn+river tree.
+pub struct TurnTreeConfig {
+    pub turn: TreeConfig,
+    pub river_bet_sizes: Vec<f64>,
+    pub river_raise_sizes: Vec<f64>,
+    pub river_max_raises: usize,
+    /// 4-card turn board as u8 indices (used to enumerate river cards).
+    pub board: Vec<u8>,
+}
+
+impl TurnTreeConfig {
+    pub fn new(board: Vec<u8>, starting_pot: f64, effective_stack: f64) -> Self {
+        TurnTreeConfig {
+            turn: TreeConfig::default_turn(starting_pot, effective_stack),
+            river_bet_sizes: vec![0.33, 0.67, 1.0],
+            river_raise_sizes: vec![1.0],
+            river_max_raises: 3,
+            board,
         }
     }
 }
@@ -164,6 +220,7 @@ fn build_node(
         return TreeNode::Terminal {
             terminal_type: TerminalType::Showdown,
             pot,
+            stacks,
             invested,
         };
     }
@@ -185,6 +242,7 @@ fn build_node(
         TreeNode::Terminal {
             terminal_type: TerminalType::Showdown,
             pot,
+            stacks,
             invested,
         }
     }
@@ -217,6 +275,7 @@ fn build_open_action(
         children.push(TreeNode::Terminal {
             terminal_type: TerminalType::Showdown,
             pot,
+            stacks,
             invested,
         });
     } else {
@@ -314,6 +373,7 @@ fn build_facing_bet(
     children.push(TreeNode::Terminal {
         terminal_type: TerminalType::Fold { folder: player },
         pot,
+        stacks,
         invested,
     });
 
@@ -334,6 +394,7 @@ fn build_facing_bet(
             children.push(TreeNode::Terminal {
                 terminal_type: TerminalType::Showdown,
                 pot: new_pot,
+                stacks: new_stacks,
                 invested: new_invested,
             });
         } else {
@@ -341,6 +402,7 @@ fn build_facing_bet(
             children.push(TreeNode::Terminal {
                 terminal_type: TerminalType::Showdown,
                 pot: new_pot,
+                stacks: new_stacks,
                 invested: new_invested,
             });
         }
@@ -410,6 +472,164 @@ fn build_facing_bet(
         stacks,
         actions,
         children,
+    }
+}
+
+/// Build a turn+river game tree.
+///
+/// Constructs the turn action tree, then replaces every Showdown terminal
+/// with a Chance node that branches into river subtrees (one per possible
+/// river card). Fold terminals are left as-is.
+///
+/// Returns (root, total_action_nodes).
+pub fn build_turn_tree(config: &TurnTreeConfig) -> (TreeNode, u16) {
+    // Build single-street turn action tree
+    let (turn_tree, mut next_id) = build_tree(&config.turn);
+
+    // Possible river cards = 52 minus board cards
+    let river_cards = remaining_deck(&config.board);
+
+    // Transform: replace Showdown terminals with Chance → river subtrees
+    let root = attach_river_streets(
+        turn_tree,
+        &config.river_bet_sizes,
+        &config.river_raise_sizes,
+        config.river_max_raises,
+        &river_cards,
+        &mut next_id,
+    );
+
+    (root, next_id)
+}
+
+/// Recursively walk the tree and replace Showdown terminals with
+/// Chance nodes leading to river action subtrees.
+fn attach_river_streets(
+    node: TreeNode,
+    river_bet_sizes: &[f64],
+    river_raise_sizes: &[f64],
+    river_max_raises: usize,
+    river_cards: &[u8],
+    next_id: &mut u16,
+) -> TreeNode {
+    match node {
+        TreeNode::Terminal {
+            terminal_type: TerminalType::Showdown,
+            pot,
+            stacks,
+            invested,
+        } => {
+            // Replace with Chance node → river subtrees
+            let eff_stack = stacks[0].min(stacks[1]);
+            let mut children = Vec::with_capacity(river_cards.len());
+
+            for &_card in river_cards {
+                let river_config = TreeConfig {
+                    bet_sizes: river_bet_sizes.to_vec(),
+                    raise_sizes: river_raise_sizes.to_vec(),
+                    max_raises: river_max_raises,
+                    starting_pot: pot,
+                    effective_stack: eff_stack,
+                    add_allin: true,
+                };
+                let river_root = build_node(
+                    &river_config,
+                    Player::OOP,
+                    pot,
+                    [eff_stack; 2],
+                    invested,
+                    0,
+                    false,
+                    0.0,
+                    false,
+                    next_id,
+                );
+                children.push(river_root);
+            }
+
+            TreeNode::Chance {
+                pot,
+                stacks,
+                invested,
+                cards: river_cards.to_vec(),
+                children,
+            }
+        }
+        TreeNode::Terminal { .. } => node, // Fold terminals stay
+        TreeNode::Action {
+            node_id,
+            player,
+            pot,
+            stacks,
+            actions,
+            children,
+        } => {
+            let new_children = children
+                .into_iter()
+                .map(|c| {
+                    attach_river_streets(
+                        c,
+                        river_bet_sizes,
+                        river_raise_sizes,
+                        river_max_raises,
+                        river_cards,
+                        next_id,
+                    )
+                })
+                .collect();
+            TreeNode::Action {
+                node_id,
+                player,
+                pot,
+                stacks,
+                actions,
+                children: new_children,
+            }
+        }
+        TreeNode::Chance { .. } => node, // Shouldn't exist yet, pass through
+    }
+}
+
+/// Metadata about an action node, used to initialize FlatCfr.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeMeta {
+    pub node_id: u16,
+    pub player: Player,
+    pub num_actions: u8,
+}
+
+/// Collect metadata for all action nodes in the tree, sorted by node_id.
+pub fn collect_node_metadata(tree: &TreeNode) -> Vec<NodeMeta> {
+    let mut metas = Vec::new();
+    collect_meta_recursive(tree, &mut metas);
+    metas.sort_by_key(|m| m.node_id);
+    metas
+}
+
+fn collect_meta_recursive(node: &TreeNode, metas: &mut Vec<NodeMeta>) {
+    match node {
+        TreeNode::Action {
+            node_id,
+            player,
+            actions,
+            children,
+            ..
+        } => {
+            metas.push(NodeMeta {
+                node_id: *node_id,
+                player: *player,
+                num_actions: actions.len() as u8,
+            });
+            for c in children {
+                collect_meta_recursive(c, metas);
+            }
+        }
+        TreeNode::Chance { children, .. } => {
+            for c in children {
+                collect_meta_recursive(c, metas);
+            }
+        }
+        TreeNode::Terminal { .. } => {}
     }
 }
 
@@ -489,6 +709,11 @@ mod tests {
                     collect_node_ids(c, ids);
                 }
             }
+            TreeNode::Chance { children, .. } => {
+                for c in children {
+                    collect_node_ids(c, ids);
+                }
+            }
             TreeNode::Terminal { .. } => {}
         }
     }
@@ -529,6 +754,131 @@ mod tests {
         if let TreeNode::Action { actions, .. } = &root {
             assert_eq!(actions.len(), 1);
             assert_eq!(actions[0], Action::Check);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Turn tree tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn turn_tree_has_chance_nodes() {
+        // Board: 4 turn cards (indices 0,1,2,3)
+        let config = TurnTreeConfig::new(vec![0, 1, 2, 3], 10.0, 20.0);
+        let (root, _num_nodes) = build_turn_tree(&config);
+
+        // Count chance nodes in the tree
+        fn count_chance(node: &TreeNode) -> usize {
+            match node {
+                TreeNode::Chance { children, .. } => {
+                    1 + children.iter().map(count_chance).sum::<usize>()
+                }
+                TreeNode::Action { children, .. } => {
+                    children.iter().map(count_chance).sum()
+                }
+                TreeNode::Terminal { .. } => 0,
+            }
+        }
+
+        let num_chance = count_chance(&root);
+        assert!(num_chance > 0, "Turn tree should have chance nodes");
+    }
+
+    #[test]
+    fn turn_tree_chance_node_has_48_children() {
+        // 4 board cards → 48 possible river cards
+        let config = TurnTreeConfig::new(vec![0, 1, 2, 3], 10.0, 20.0);
+        let (root, _) = build_turn_tree(&config);
+
+        // Find first chance node
+        fn find_chance(node: &TreeNode) -> Option<usize> {
+            match node {
+                TreeNode::Chance { children, .. } => Some(children.len()),
+                TreeNode::Action { children, .. } => {
+                    children.iter().find_map(find_chance)
+                }
+                TreeNode::Terminal { .. } => None,
+            }
+        }
+
+        let num_children = find_chance(&root).expect("Should have a chance node");
+        assert_eq!(num_children, 48, "48 possible river cards");
+    }
+
+    #[test]
+    fn turn_tree_node_ids_unique() {
+        let config = TurnTreeConfig::new(vec![0, 1, 2, 3], 10.0, 20.0);
+        let (root, num_nodes) = build_turn_tree(&config);
+
+        let mut ids = Vec::new();
+        collect_node_ids(&root, &mut ids);
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            total,
+            "All node IDs should be unique ({} unique out of {})",
+            ids.len(),
+            total
+        );
+        assert_eq!(ids.len(), num_nodes as usize);
+    }
+
+    #[test]
+    fn turn_tree_no_showdown_terminals() {
+        // After transformation, no Showdown terminals should remain
+        // (they should all be replaced with Chance nodes)
+        // Only Fold terminals should survive
+        let config = TurnTreeConfig::new(vec![0, 1, 2, 3], 10.0, 20.0);
+        let (root, _) = build_turn_tree(&config);
+
+        fn check_no_showdown_in_turn(node: &TreeNode, depth: usize) {
+            match node {
+                TreeNode::Terminal { terminal_type, .. } => {
+                    // Showdown terminals at turn level shouldn't exist.
+                    // They should only exist inside river subtrees (after chance nodes).
+                    if depth == 0 {
+                        assert_ne!(
+                            *terminal_type,
+                            TerminalType::Showdown,
+                            "Turn level should have no Showdown terminals"
+                        );
+                    }
+                }
+                TreeNode::Action { children, .. } => {
+                    for c in children {
+                        check_no_showdown_in_turn(c, depth);
+                    }
+                }
+                TreeNode::Chance { children, .. } => {
+                    // Past a chance node, we're in river subtrees — showdowns are OK
+                    for c in children {
+                        check_no_showdown_in_turn(c, depth + 1);
+                    }
+                }
+            }
+        }
+
+        check_no_showdown_in_turn(&root, 0);
+    }
+
+    #[test]
+    fn turn_tree_collect_metadata() {
+        let config = TurnTreeConfig::new(vec![0, 1, 2, 3], 10.0, 20.0);
+        let (root, num_nodes) = build_turn_tree(&config);
+
+        let metas = collect_node_metadata(&root);
+        assert_eq!(
+            metas.len(),
+            num_nodes as usize,
+            "Metadata count should match total action nodes"
+        );
+
+        // Verify sorted by node_id and sequential
+        for (i, m) in metas.iter().enumerate() {
+            assert_eq!(m.node_id, i as u16);
+            assert!(m.num_actions >= 1);
         }
     }
 }

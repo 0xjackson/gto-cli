@@ -61,7 +61,7 @@ gto action AhQd --position BTN --board Ks9d4c7hQc --pot 10 --stack 95.5
 | 1 | Push/fold solver | DONE | 3-5 sec | Instant |
 | 2 | Full preflop (open/3bet/4bet/5bet) | DONE | 3 min | Instant |
 | 3 | River solver | DONE | 1-5 sec/spot | Instant |
-| 4 | Turn solver (includes river) | TODO | 15-45 sec/spot | Instant |
+| 4 | Turn solver (includes river) | DONE | 15-45 sec/spot | Instant |
 | 5 | Flop solver (includes turn+river) | TODO | 1-4 min/spot | Instant |
 | 6 | Infrastructure: CFR engine optimization | TODO | N/A | N/A |
 | 7 | Railway deployment + batch pre-solve | TODO | Background | Instant |
@@ -170,102 +170,30 @@ These are functional but suboptimal. Phase 4 (turn solver) will need these fixed
 
 ---
 
-## Phase 4: Turn Solver
+## Phase 4: Turn Solver — DONE
 
-### Context
+Heads-up turn+river CFR+ solver with chance nodes for river card dealing and flat-array storage.
 
-One card to come (~44-46 possible river cards). For each river card, hand strengths change. Builds on Phase 3 — the river sub-trees are solved as part of the turn tree.
+**Files**: `src/flat_cfr.rs`, `src/turn_solver.rs`, `src/postflop_tree.rs` (modified), `src/cli.rs` (modified)
+**Tests**: 9 integration tests in `tests/test_turn_solver.rs`, 9 unit tests in `src/flat_cfr.rs`, 5 tree tests in `src/postflop_tree.rs`
+**Commands**: `gto solve turn --board Ks9d4c7h --oop AA,KK --ip QQ,JJ --pot 10 --stack 20 --iterations 5000`
 
-### How It Works
-
-The turn game tree has **chance nodes** where the river card is dealt:
-
-```
-Turn Action Tree (same structure as river)
-└─ After all turn actions resolve to "see river" →
-   Chance Node: deal river card (44-46 possibilities)
-   └─ For each river card → River Action Tree → Showdown
-```
-
-CFR+ traverses the **entire turn+river tree** in each iteration. It does NOT solve each river independently — the strategies are interdependent.
-
-### Scale
-
-- ~1,000 hand combos × ~45 river cards × ~40 tree nodes per street × 2 streets
-- **Info sets: ~500K-2M**
-- **Memory: 50-200 MB**
-
-### Key Optimization: Flat Array CFR Storage
-
-The current `HashMap<InfoSetKey, InfoSetData>` with `Vec<f64>` per info set won't scale. Phase 4 requires:
-
-```rust
-// BEFORE (current): ~120 bytes per info set + HashMap overhead
-pub struct CfrTrainer {
-    info_sets: HashMap<InfoSetKey, InfoSetData>,  // heap alloc per entry
-}
-
-// AFTER: ~24 bytes per info set, zero overhead
-pub struct FlatCfr {
-    regrets: Vec<f32>,    // all regrets in one contiguous array
-    strategy: Vec<f32>,   // all strategies in one contiguous array
-    num_actions: Vec<u8>, // actions per info set
-    offsets: Vec<u32>,    // index into regrets/strategy arrays
-}
-```
-
-This gives ~5x memory reduction and much better cache performance.
-
-### Decisions
-
-- **Full river enumeration** (not sampling): Only ~45 river cards, feasible to enumerate all of them exactly. More accurate than Monte Carlo sampling.
-- **f32 storage**: Switch from f64 to f32 for regrets and strategies. Halves memory, no meaningful accuracy loss.
-- **Flat array CFR**: Replace HashMap with contiguous arrays (see above).
-- **ahash**: Switch to fast hasher for any remaining HashMap usage.
-
-### Performance
-
-- **Solve time**: 15-45 seconds per spot at 50K iterations
-- **Accuracy**: Exploitability < 0.5% pot
-- **Memory**: 50-200 MB per solve
-- **Query**: Instant from cache
-
-### Files
-
-| File | Action |
-|---|---|
-| `src/flat_cfr.rs` | NEW — flat array CFR engine (replaces HashMap-based for postflop) |
-| `src/postflop_solver.rs` | MODIFY — add turn solver, chance node handling |
-| `src/postflop_tree.rs` | MODIFY — add chance nodes for river card |
-| `src/cli.rs` | MODIFY — turn support in solve/strategy commands |
-| `tests/test_turn_solver.rs` | NEW |
-
-### Steps
-
-**4.1**: Flat array CFR engine (`src/flat_cfr.rs`)
-- `FlatCfr` struct with f32 contiguous arrays
-- Same CFR+ algorithm, but ~5x less memory and better cache perf
-- Regret matching, average strategy, update — all using flat indexing
-
-**4.2**: Chance node support in game tree (`src/postflop_tree.rs`)
-- Add `Chance` variant to `PostflopNode`
-- Enumerate all possible river cards (excluding board + hand blockers)
-- Weight each river outcome equally (uniform chance)
-
-**4.3**: Turn solver (`src/postflop_solver.rs`)
-- `TurnSolver`: builds turn+river tree, runs CFR+ through entire tree
-- Each iteration traverses turn actions → chance node → all river subtrees
-- Hand strength re-evaluated for each river card using `evaluate_fast()`
-
-**4.4**: Turn caching + CLI
+**Key decisions made**:
+- `FlatCfr` engine with contiguous f32 arrays (~5x memory reduction vs HashMap-based `CfrTrainer`)
+- Node-based layout: `offsets[node] + hand * num_actions + action` for cache-friendly access
+- Two `FlatCfr` instances (one per player) to avoid borrow conflicts — no snapshot needed
+- `Chance` variant added to `TreeNode` enum, with `stacks` added to `Terminal` variant
+- `build_turn_tree()` builds turn action tree then transforms Showdown terminals into Chance nodes with river subtrees
+- Full river enumeration (~48 cards), hand strengths re-evaluated per river card via `evaluate_fast()`
+- Separate `cfr_traverse_turn` (handles action + chance nodes) and `cfr_traverse_river` (handles river subtrees with 5-card showdown eval)
+- Blocker-aware reach propagation: combos conflicting with dealt river card get zeroed out
+- Turn bet sizes: 50%, 100% pot. River bet sizes: 33%, 67%, 100% pot
 - Cache to `~/.gto-cli/solver/turn_{board}_{pot}_{stack}.json`
-- `gto solve postflop --board XsXdXcXd` detects 4-card board → turn solve
 
-**4.5**: Tests
-- Convergence: exploitability < 0.5% pot
-- Drawing hands bet more on turn than river (semi-bluff)
-- Made hands with draws bet bigger (protection)
-- Strategy changes based on river card (e.g., flush-completing river changes action)
+**Architecture**:
+- `src/flat_cfr.rs`: `FlatCfr` struct with f32 contiguous arrays, regret matching, CFR+ update
+- `src/postflop_tree.rs`: `Chance` node variant, `TurnTreeConfig`, `build_turn_tree()`, `collect_node_metadata()`
+- `src/turn_solver.rs`: `solve_turn()`, two-level traversal (turn + river), exploitability via best-response, caching, display
 
 ---
 

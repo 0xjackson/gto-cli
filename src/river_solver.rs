@@ -339,7 +339,7 @@ fn collect_strategies(
                 collect_strategies(child, player, num_combos, trainer, snapshot);
             }
         }
-        TreeNode::Terminal { .. } => {}
+        TreeNode::Terminal { .. } | TreeNode::Chance { .. } => {}
     }
 }
 
@@ -356,7 +356,7 @@ fn cfr_traverse(
 ) -> f64 {
     match node {
         TreeNode::Terminal {
-            terminal_type, pot, invested,
+            terminal_type, pot, invested, ..
         } => {
             compute_terminal_value(
                 *terminal_type, *pot, invested, traverser, hand_idx, opp_reach, showdown,
@@ -427,6 +427,7 @@ fn cfr_traverse(
                 node_value
             }
         }
+        TreeNode::Chance { .. } => unreachable!("River solver does not use chance nodes"),
     }
 }
 
@@ -587,7 +588,7 @@ fn br_traverse(
     trainer: &CfrTrainer,
 ) -> f64 {
     match node {
-        TreeNode::Terminal { terminal_type, pot, invested } => {
+        TreeNode::Terminal { terminal_type, pot, invested, .. } => {
             compute_terminal_value(
                 *terminal_type, *pot, invested, br_player, hand_idx, opp_reach, showdown,
             )
@@ -631,6 +632,7 @@ fn br_traverse(
                 node_value
             }
         }
+        TreeNode::Chance { .. } => unreachable!("River solver does not use chance nodes"),
     }
 }
 
@@ -644,7 +646,7 @@ fn avg_strategy_traverse(
     trainer: &CfrTrainer,
 ) -> f64 {
     match node {
-        TreeNode::Terminal { terminal_type, pot, invested } => {
+        TreeNode::Terminal { terminal_type, pot, invested, .. } => {
             compute_terminal_value(
                 *terminal_type, *pot, invested, perspective, hand_idx, opp_reach, showdown,
             )
@@ -692,6 +694,7 @@ fn avg_strategy_traverse(
                 node_value
             }
         }
+        TreeNode::Chance { .. } => unreachable!("River solver does not use chance nodes"),
     }
 }
 
@@ -799,7 +802,7 @@ fn extract_node_strategies(
                 extract_node_strategies(child, trainer, showdown, strategies);
             }
         }
-        TreeNode::Terminal { .. } => {}
+        TreeNode::Terminal { .. } | TreeNode::Chance { .. } => {}
     }
 }
 

@@ -1,6 +1,7 @@
 pub mod card_encoding;
 pub mod cards;
 pub mod cfr;
+pub mod flat_cfr;
 pub mod display;
 pub mod equity;
 pub mod error;
@@ -16,3 +17,4 @@ pub mod preflop;
 pub mod preflop_solver;
 pub mod ranges;
 pub mod river_solver;
+pub mod turn_solver;
