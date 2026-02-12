@@ -255,6 +255,27 @@ enum SolverCommands {
         #[arg(short, long, default_value = "10000")]
         iterations: usize,
     },
+    /// Solve a river spot using CFR+
+    River {
+        /// Board cards (exactly 5 for river, e.g., Ks9d4c7hQc)
+        #[arg(short, long)]
+        board: String,
+        /// OOP player range (e.g., "AA,AKs,KQs")
+        #[arg(long)]
+        oop: String,
+        /// IP player range (e.g., "QQ,JJ,TT")
+        #[arg(long)]
+        ip: String,
+        /// Starting pot size
+        #[arg(short, long, default_value = "10")]
+        pot: f64,
+        /// Effective stack remaining
+        #[arg(short, long, default_value = "20")]
+        stack: f64,
+        /// Number of CFR+ iterations
+        #[arg(short, long, default_value = "10000")]
+        iterations: usize,
+    },
 }
 
 fn validate_position(pos: &str, table_size: &str) -> Result<String, String> {
@@ -338,6 +359,14 @@ pub fn run() {
                 rake,
                 iterations,
             } => cmd_solve_pushfold(stack, rake, iterations),
+            SolverCommands::River {
+                board,
+                oop,
+                ip,
+                pot,
+                stack,
+                iterations,
+            } => cmd_solve_river(board, oop, ip, pot, stack, iterations),
         },
     }
 }
@@ -1150,4 +1179,35 @@ fn cmd_solve_pushfold(stack: f64, rake: f64, iterations: usize) {
 
     let result = solve_push_fold(stack, iterations, rake);
     result.display();
+}
+
+fn cmd_solve_river(board: String, oop: String, ip: String, pot: f64, stack: f64, iterations: usize) {
+    use crate::river_solver::{RiverSolverConfig, solve_river};
+
+    if pot <= 0.0 {
+        print_error("Pot must be positive");
+        return;
+    }
+    if stack <= 0.0 {
+        print_error("Stack must be positive");
+        return;
+    }
+
+    let config = match RiverSolverConfig::new(&board, &oop, &ip, pot, stack, iterations) {
+        Ok(c) => c,
+        Err(ref e) => {
+            print_error(e);
+            return;
+        }
+    };
+
+    println!();
+    println!(
+        "  Solving river: board={}, pot={}, stack={}, {} iterations...",
+        board, pot, stack, iterations
+    );
+
+    let result = solve_river(&config);
+    result.display();
+    result.save_cache();
 }
