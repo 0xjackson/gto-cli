@@ -913,15 +913,15 @@ impl RiverSolution {
         let dir = std::path::Path::new(&home).join(".gto-cli").join("solver");
         std::fs::create_dir_all(&dir).ok();
         dir.join(format!(
-            "river_{}_{:.0}_{:.0}.json",
+            "river_{}_{:.0}_{:.0}.bin",
             self.board, self.starting_pot, self.effective_stack,
         ))
     }
 
     pub fn save_cache(&self) {
-        if let Ok(json) = serde_json::to_string(self) {
+        if let Ok(data) = bincode::serialize(self) {
             let path = self.cache_path();
-            std::fs::write(path, json).ok();
+            std::fs::write(path, data).ok();
         }
     }
 
@@ -930,8 +930,8 @@ impl RiverSolution {
         let path = std::path::Path::new(&home)
             .join(".gto-cli")
             .join("solver")
-            .join(format!("river_{}_{:.0}_{:.0}.json", board, pot, stack));
-        let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+            .join(format!("river_{}_{:.0}_{:.0}.bin", board, pot, stack));
+        let data = std::fs::read(path).ok()?;
+        bincode::deserialize(&data).ok()
     }
 }
