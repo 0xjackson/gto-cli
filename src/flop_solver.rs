@@ -107,6 +107,15 @@ pub struct TemplateBucketStrategy {
     pub frequencies: Vec<Vec<f64>>,
 }
 
+/// Edge in the game tree: (from_node_id, action_label, to_node_id).
+/// Only action→action edges are stored (terminals have no decisions).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeEdge {
+    pub from: u16,
+    pub action: String,
+    pub to: u16,
+}
+
 /// Full solution from the flop solver.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FlopSolution {
@@ -136,6 +145,15 @@ pub struct FlopSolution {
     /// Number of buckets used for turn/river template strategies.
     #[serde(default)]
     pub num_buckets: usize,
+    /// Tree edges for flop action navigation.
+    #[serde(default)]
+    pub flop_tree_edges: Vec<TreeEdge>,
+    /// Tree edges for turn template navigation.
+    #[serde(default)]
+    pub turn_tree_edges: Vec<TreeEdge>,
+    /// Tree edges for river template navigation.
+    #[serde(default)]
+    pub river_tree_edges: Vec<TreeEdge>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2542,6 +2560,14 @@ fn extract_solution(
         &mut river_strategies,
     );
 
+    // Extract tree edges for action navigation
+    let mut flop_tree_edges = Vec::new();
+    extract_tree_edges(flop_tree, &mut flop_tree_edges);
+    let mut turn_tree_edges = Vec::new();
+    extract_tree_edges(turn_template, &mut turn_tree_edges);
+    let mut river_tree_edges = Vec::new();
+    extract_tree_edges(river_template, &mut river_tree_edges);
+
     let board_str = config
         .board
         .iter()
@@ -2573,6 +2599,9 @@ fn extract_solution(
         turn_strategies,
         river_strategies,
         num_buckets: config.num_buckets,
+        flop_tree_edges,
+        turn_tree_edges,
+        river_tree_edges,
     }
 }
 
@@ -2691,6 +2720,32 @@ fn extract_template_strategies(
     }
 }
 
+/// Extract edges between action nodes in a tree for navigation.
+/// Records (from_node_id, action_label, to_node_id) for each action→action edge.
+fn extract_tree_edges(node: &TreeNode, edges: &mut Vec<TreeEdge>) {
+    if let TreeNode::Action {
+        node_id,
+        actions,
+        children,
+        ..
+    } = node
+    {
+        for (i, child) in children.iter().enumerate() {
+            if let TreeNode::Action {
+                node_id: child_id, ..
+            } = child
+            {
+                edges.push(TreeEdge {
+                    from: *node_id,
+                    action: actions[i].label(),
+                    to: *child_id,
+                });
+            }
+            extract_tree_edges(child, edges);
+        }
+    }
+}
+
 fn empty_solution(config: &FlopSolverConfig) -> FlopSolution {
     let board_str = config
         .board
@@ -2714,6 +2769,9 @@ fn empty_solution(config: &FlopSolverConfig) -> FlopSolution {
         turn_strategies: vec![],
         river_strategies: vec![],
         num_buckets: 0,
+        flop_tree_edges: vec![],
+        turn_tree_edges: vec![],
+        river_tree_edges: vec![],
     }
 }
 

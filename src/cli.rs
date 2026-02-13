@@ -1790,7 +1790,7 @@ fn cmd_query(
             );
 
             match engine.query_postflop(
-                &hand, hero, villain, board_str, pot_val, stack_val, iterations,
+                &hand, hero, villain, board_str, pot_val, stack_val, iterations, &[],
             ) {
                 Ok(result) => {
                     if result.source == StrategySource::NotInRange {

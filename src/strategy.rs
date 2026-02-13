@@ -4,7 +4,7 @@
 use crate::bucketing::assign_buckets;
 use crate::card_encoding::card_to_index;
 use crate::cards::parse_board;
-use crate::flop_solver::{FlopSolverConfig, FlopSolution, TemplateBucketStrategy, solve_flop};
+use crate::flop_solver::{FlopSolverConfig, FlopSolution, TemplateBucketStrategy, TreeEdge, solve_flop};
 use crate::preflop_solver::{Position, PreflopSolution, PreflopSpotResult};
 use crate::river_solver::{RiverSolverConfig, RiverSolution, solve_river};
 use crate::turn_solver::{TurnSolverConfig, TurnSolution, solve_turn};
@@ -208,6 +208,8 @@ impl StrategyEngine {
 
     /// Query postflop strategy for a specific hand on a given board.
     /// Will solve on-demand if no cached solution exists.
+    /// `action_path` is an optional sequence of actions taken so far on this street
+    /// (e.g., &["x", "b"] for "OOP checked, IP bet"). Empty means root node.
     pub fn query_postflop(
         &mut self,
         hand: &str,
@@ -217,6 +219,7 @@ impl StrategyEngine {
         pot: f64,
         stack: f64,
         iterations: usize,
+        action_path: &[String],
     ) -> Result<StrategyResult, String> {
         let board_len = board.len();
         let hero_side = if hero.is_ip_vs(&villain) { "IP" } else { "OOP" };
@@ -234,9 +237,9 @@ impl StrategyEngine {
         let ip_str = ip_range.join(",");
 
         match board_len {
-            6 => self.query_flop(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str()),
-            8 => self.query_turn(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str()),
-            10 => self.query_river(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str()),
+            6 => self.query_flop(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str(), action_path),
+            8 => self.query_turn(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str(), action_path),
+            10 => self.query_river(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str(), action_path),
             _ => Err(format!("Invalid board length: {} chars (expected 6, 8, or 10)", board_len)),
         }
     }
@@ -293,10 +296,11 @@ impl StrategyEngine {
         iterations: usize,
         oop_pos: &str,
         ip_pos: &str,
+        action_path: &[String],
     ) -> Result<StrategyResult, String> {
         // Try cache first (with position info in key)
         if let Some(solution) = FlopSolution::load_cache(board, oop_pos, ip_pos, pot, stack) {
-            return lookup_in_flop_solution(&solution, hand, hero_side);
+            return lookup_in_flop_solution(&solution, hand, hero_side, action_path);
         }
 
         // Solve on-demand
@@ -307,7 +311,7 @@ impl StrategyEngine {
         solution.ip_pos = ip_pos.to_string();
         solution.save_cache();
 
-        lookup_in_flop_solution(&solution, hand, hero_side)
+        lookup_in_flop_solution(&solution, hand, hero_side, action_path)
     }
 
     fn query_turn(
@@ -322,10 +326,11 @@ impl StrategyEngine {
         iterations: usize,
         oop_pos: &str,
         ip_pos: &str,
+        action_path: &[String],
     ) -> Result<StrategyResult, String> {
         // 1. Check dedicated turn cache
         if let Some(solution) = TurnSolution::load_cache(board, oop_pos, ip_pos, pot, stack) {
-            return lookup_in_turn_solution(&solution, hand, hero_side);
+            return lookup_in_turn_solution(&solution, hand, hero_side, action_path);
         }
 
         // 2. Check flop solution for embedded turn template strategies
@@ -334,6 +339,7 @@ impl StrategyEngine {
             if !flop_sol.turn_strategies.is_empty() {
                 if let Ok(result) = lookup_in_template_strategy(
                     &flop_sol, hand, hero_side, board, &flop_sol.turn_strategies,
+                    &flop_sol.turn_tree_edges, action_path,
                 ) {
                     return Ok(result);
                 }
@@ -348,7 +354,7 @@ impl StrategyEngine {
         solution.ip_pos = ip_pos.to_string();
         solution.save_cache();
 
-        lookup_in_turn_solution(&solution, hand, hero_side)
+        lookup_in_turn_solution(&solution, hand, hero_side, action_path)
     }
 
     fn query_river(
@@ -363,10 +369,11 @@ impl StrategyEngine {
         iterations: usize,
         oop_pos: &str,
         ip_pos: &str,
+        action_path: &[String],
     ) -> Result<StrategyResult, String> {
         // 1. Check dedicated river cache
         if let Some(solution) = RiverSolution::load_cache(board, oop_pos, ip_pos, pot, stack) {
-            return lookup_in_river_solution(&solution, hand, hero_side);
+            return lookup_in_river_solution(&solution, hand, hero_side, action_path);
         }
 
         // 2. Check flop solution for embedded river template strategies
@@ -375,6 +382,7 @@ impl StrategyEngine {
             if !flop_sol.river_strategies.is_empty() {
                 if let Ok(result) = lookup_in_template_strategy(
                     &flop_sol, hand, hero_side, board, &flop_sol.river_strategies,
+                    &flop_sol.river_tree_edges, action_path,
                 ) {
                     return Ok(result);
                 }
@@ -389,7 +397,65 @@ impl StrategyEngine {
         solution.ip_pos = ip_pos.to_string();
         solution.save_cache();
 
-        lookup_in_river_solution(&solution, hand, hero_side)
+        lookup_in_river_solution(&solution, hand, hero_side, action_path)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Action path navigation
+// ---------------------------------------------------------------------------
+
+/// Navigate tree edges following an action path. Returns the target node_id.
+///
+/// Action codes: "x"/"check" → Check, "b"/"bet" → Bet, "c"/"call" → Call,
+/// "r"/"raise" → Raise, "f"/"fold" → Fold.
+/// Can also match exact action labels like "Bet 2.0" or "Check".
+fn navigate_to_node(edges: &[TreeEdge], action_path: &[String]) -> Option<u16> {
+    if action_path.is_empty() {
+        return None; // no navigation needed, use root
+    }
+
+    // Find root node (smallest from_id that doesn't appear as any to_id)
+    let to_ids: std::collections::HashSet<u16> = edges.iter().map(|e| e.to).collect();
+    let root_id = edges
+        .iter()
+        .map(|e| e.from)
+        .find(|id| !to_ids.contains(id))?;
+
+    let mut current = root_id;
+    for action_code in action_path {
+        let matching_edge = edges.iter().find(|e| {
+            e.from == current && action_matches(&e.action, action_code)
+        });
+        match matching_edge {
+            Some(edge) => current = edge.to,
+            None => return None, // action path leads to terminal or invalid
+        }
+    }
+    Some(current)
+}
+
+/// Check if a tree action label matches a user action code.
+fn action_matches(action_label: &str, code: &str) -> bool {
+    let lower = code.to_lowercase();
+    let label_lower = action_label.to_lowercase();
+
+    // Exact match
+    if label_lower == lower {
+        return true;
+    }
+
+    match lower.as_str() {
+        "x" | "check" => label_lower.starts_with("check"),
+        "f" | "fold" => label_lower.starts_with("fold"),
+        "c" | "call" => label_lower.starts_with("call"),
+        "b" | "bet" => label_lower.starts_with("bet"),
+        "r" | "raise" => label_lower.starts_with("raise"),
+        _ => {
+            // Try prefix match for specific sizes: "b33" matches "Bet 2.0" (33% pot)
+            // or partial label match: "bet 2" matches "Bet 2.0"
+            label_lower.starts_with(&lower)
+        }
     }
 }
 
@@ -401,6 +467,7 @@ fn lookup_in_flop_solution(
     solution: &FlopSolution,
     hand: &str,
     hero_side: &str,
+    action_path: &[String],
 ) -> Result<StrategyResult, String> {
     let combos = if hero_side == "OOP" {
         &solution.oop_combos
@@ -419,9 +486,19 @@ fn lookup_in_flop_solution(
         }
     };
 
-    // Find first strategy node matching hero's side
+    // Navigate to target node if action path provided
+    let target_node = if action_path.is_empty() {
+        None
+    } else {
+        navigate_to_node(&solution.flop_tree_edges, action_path)
+    };
+
     for strat in &solution.strategies {
-        if strat.player == hero_side && combo_idx < strat.frequencies.len() {
+        let node_match = match target_node {
+            Some(nid) => strat.node_id == nid,
+            None => strat.player == hero_side, // root: first node matching hero's side
+        };
+        if node_match && combo_idx < strat.frequencies.len() {
             return Ok(StrategyResult {
                 actions: strat.actions.clone(),
                 frequencies: strat.frequencies[combo_idx].clone(),
@@ -430,13 +507,18 @@ fn lookup_in_flop_solution(
         }
     }
 
-    Err("No strategy found for hero's side at root node".to_string())
+    Err(if action_path.is_empty() {
+        "No strategy found for hero's side at root node".to_string()
+    } else {
+        format!("Could not navigate action path: {:?}", action_path)
+    })
 }
 
 fn lookup_in_turn_solution(
     solution: &TurnSolution,
     hand: &str,
     hero_side: &str,
+    _action_path: &[String],
 ) -> Result<StrategyResult, String> {
     let combos = if hero_side == "OOP" {
         &solution.oop_combos
@@ -455,6 +537,7 @@ fn lookup_in_turn_solution(
         }
     };
 
+    // TurnSolution doesn't store tree edges yet — return root node
     for strat in &solution.strategies {
         if strat.player == hero_side && combo_idx < strat.frequencies.len() {
             return Ok(StrategyResult {
@@ -472,6 +555,7 @@ fn lookup_in_river_solution(
     solution: &RiverSolution,
     hand: &str,
     hero_side: &str,
+    _action_path: &[String],
 ) -> Result<StrategyResult, String> {
     let combos = if hero_side == "OOP" {
         &solution.oop_combos
@@ -490,6 +574,7 @@ fn lookup_in_river_solution(
         }
     };
 
+    // RiverSolution doesn't store tree edges yet — return root node
     for strat in &solution.strategies {
         if strat.player == hero_side && combo_idx < strat.frequencies.len() {
             return Ok(StrategyResult {
@@ -515,6 +600,8 @@ fn lookup_in_template_strategy(
     hero_side: &str,
     board: &str,
     template_strategies: &[TemplateBucketStrategy],
+    tree_edges: &[TreeEdge],
+    action_path: &[String],
 ) -> Result<StrategyResult, String> {
     if flop_sol.num_buckets == 0 {
         return Err("No bucket info in flop solution".to_string());
@@ -552,9 +639,19 @@ fn lookup_in_template_strategy(
     let buckets = assign_buckets(&[(h0, h1)], &board_indices, flop_sol.num_buckets, num_samples);
     let bucket = buckets[0] as usize;
 
-    // Find first strategy node matching hero's side
+    // Navigate to target node if action path provided
+    let target_node = if action_path.is_empty() {
+        None
+    } else {
+        navigate_to_node(tree_edges, action_path)
+    };
+
     for strat in template_strategies {
-        if strat.player == hero_side && bucket < strat.frequencies.len() {
+        let node_match = match target_node {
+            Some(nid) => strat.node_id == nid,
+            None => strat.player == hero_side,
+        };
+        if node_match && bucket < strat.frequencies.len() {
             return Ok(StrategyResult {
                 actions: strat.actions.clone(),
                 frequencies: strat.frequencies[bucket].clone(),
@@ -740,9 +837,8 @@ mod tests {
         assert!(format_strategy(&result).contains("not in range"));
     }
 
-    #[test]
-    fn test_lookup_in_template_strategy_not_in_range() {
-        let flop_sol = FlopSolution {
+    fn test_flop_sol() -> FlopSolution {
+        FlopSolution {
             board: "Ks9d4c".to_string(),
             oop_range: vec!["AKs".to_string()],
             ip_range: vec!["QQ".to_string()],
@@ -763,11 +859,18 @@ mod tests {
             }],
             river_strategies: vec![],
             num_buckets: 200,
-        };
-        // Hand not in range → NotInRange
+            flop_tree_edges: vec![],
+            turn_tree_edges: vec![],
+            river_tree_edges: vec![],
+        }
+    }
+
+    #[test]
+    fn test_lookup_in_template_strategy_not_in_range() {
+        let flop_sol = test_flop_sol();
         let result = lookup_in_template_strategy(
             &flop_sol, "2h3c", "OOP", "Ks9d4c7h",
-            &flop_sol.turn_strategies,
+            &flop_sol.turn_strategies, &flop_sol.turn_tree_edges, &[],
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().source, StrategySource::NotInRange);
@@ -775,37 +878,51 @@ mod tests {
 
     #[test]
     fn test_lookup_in_template_strategy_finds_bucket() {
-        let flop_sol = FlopSolution {
-            board: "Ks9d4c".to_string(),
-            oop_range: vec!["AKs".to_string()],
-            ip_range: vec!["QQ".to_string()],
-            starting_pot: 6.0,
-            effective_stack: 97.0,
-            iterations: 100,
-            exploitability: 0.0,
-            oop_combos: vec!["AhKh".to_string(), "AdKd".to_string()],
-            ip_combos: vec!["QhQc".to_string()],
-            strategies: vec![],
-            oop_pos: "BB".to_string(),
-            ip_pos: "BTN".to_string(),
-            turn_strategies: vec![TemplateBucketStrategy {
-                node_id: 0,
-                player: "OOP".to_string(),
-                actions: vec!["Check".to_string(), "Bet 0.7".to_string()],
-                frequencies: vec![vec![0.6, 0.4]; 200],
-            }],
-            river_strategies: vec![],
-            num_buckets: 200,
-        };
-        // Hand IS in range → should get a strategy back
+        let flop_sol = test_flop_sol();
         let result = lookup_in_template_strategy(
             &flop_sol, "AhKh", "OOP", "Ks9d4c7h",
-            &flop_sol.turn_strategies,
+            &flop_sol.turn_strategies, &flop_sol.turn_tree_edges, &[],
         );
         assert!(result.is_ok());
         let r = result.unwrap();
         assert_eq!(r.source, StrategySource::Cached);
         assert_eq!(r.actions.len(), 2);
         assert_eq!(r.frequencies.len(), 2);
+    }
+
+    #[test]
+    fn test_action_matches() {
+        assert!(action_matches("Check", "x"));
+        assert!(action_matches("Check", "check"));
+        assert!(action_matches("Bet 2.0", "b"));
+        assert!(action_matches("Bet 2.0", "bet"));
+        assert!(action_matches("Call 2.0", "c"));
+        assert!(action_matches("Raise 6.0", "r"));
+        assert!(action_matches("Fold", "f"));
+        assert!(!action_matches("Check", "b"));
+        assert!(!action_matches("Bet 2.0", "x"));
+    }
+
+    #[test]
+    fn test_navigate_to_node() {
+        use crate::flop_solver::TreeEdge;
+        // Tree: root(0,OOP) --Check--> 1(IP) --Bet--> 2(OOP)
+        //                    --Bet--> 3(IP)
+        let edges = vec![
+            TreeEdge { from: 0, action: "Check".to_string(), to: 1 },
+            TreeEdge { from: 0, action: "Bet 2.0".to_string(), to: 3 },
+            TreeEdge { from: 1, action: "Check".to_string(), to: 4 },
+            TreeEdge { from: 1, action: "Bet 2.0".to_string(), to: 2 },
+        ];
+        // Empty path → None (use root)
+        assert_eq!(navigate_to_node(&edges, &[]), None);
+        // "x" → node 1
+        assert_eq!(navigate_to_node(&edges, &["x".to_string()]), Some(1));
+        // "x", "b" → node 2
+        assert_eq!(navigate_to_node(&edges, &["x".to_string(), "b".to_string()]), Some(2));
+        // "b" → node 3
+        assert_eq!(navigate_to_node(&edges, &["b".to_string()]), Some(3));
+        // invalid path → None
+        assert_eq!(navigate_to_node(&edges, &["x".to_string(), "f".to_string()]), None);
     }
 }

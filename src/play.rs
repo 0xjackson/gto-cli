@@ -666,7 +666,7 @@ fn show_street_advice(
         _ => 10000,
     };
 
-    match engine.query_postflop(hand_str, hero, villain, board_str, pot, stack, iterations) {
+    match engine.query_postflop(hand_str, hero, villain, board_str, pot, stack, iterations, &[]) {
         Ok(result) if result.source != StrategySource::NotInRange && !result.actions.is_empty() => {
             writeln!(writer, "  {}", format_strategy(&result)).ok();
             return;
