@@ -110,6 +110,12 @@ pub struct FlopSolution {
     pub ip_combos: Vec<String>,
     /// Strategies for flop-level action nodes only.
     pub strategies: Vec<FlopNodeStrategy>,
+    /// OOP position label (e.g. "BB") — used in cache key.
+    #[serde(default)]
+    pub oop_pos: String,
+    /// IP position label (e.g. "BTN") — used in cache key.
+    #[serde(default)]
+    pub ip_pos: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2524,6 +2530,8 @@ fn extract_solution(
         oop_combos: oop_combo_strs,
         ip_combos: ip_combo_strs,
         strategies,
+        oop_pos: String::new(),
+        ip_pos: String::new(),
     }
 }
 
@@ -2607,6 +2615,8 @@ fn empty_solution(config: &FlopSolverConfig) -> FlopSolution {
         oop_combos: vec![],
         ip_combos: vec![],
         strategies: vec![],
+        oop_pos: String::new(),
+        ip_pos: String::new(),
     }
 }
 
@@ -2692,8 +2702,8 @@ impl FlopSolution {
         let dir = std::path::Path::new(&home).join(".gto-cli").join("solver");
         std::fs::create_dir_all(&dir).ok();
         dir.join(format!(
-            "flop_{}_{:.0}_{:.0}.bin",
-            self.board, self.starting_pot, self.effective_stack,
+            "flop_{}_{}_{}_{:.0}_{:.0}.bin",
+            self.board, self.oop_pos, self.ip_pos, self.starting_pot, self.effective_stack,
         ))
     }
 
@@ -2704,12 +2714,12 @@ impl FlopSolution {
         }
     }
 
-    pub fn load_cache(board: &str, pot: f64, stack: f64) -> Option<FlopSolution> {
+    pub fn load_cache(board: &str, oop_pos: &str, ip_pos: &str, pot: f64, stack: f64) -> Option<FlopSolution> {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         let path = std::path::Path::new(&home)
             .join(".gto-cli")
             .join("solver")
-            .join(format!("flop_{}_{:.0}_{:.0}.bin", board, pot, stack));
+            .join(format!("flop_{}_{}_{}_{:.0}_{:.0}.bin", board, oop_pos, ip_pos, pot, stack));
         let data = std::fs::read(path).ok()?;
         bincode::deserialize(&data).ok()
     }

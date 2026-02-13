@@ -70,6 +70,8 @@ struct BatchSpot {
     ip_range: String,
     pot: f64,
     stack: f64,
+    oop_pos: String,
+    ip_pos: String,
 }
 
 fn generate_manifest(
@@ -100,10 +102,10 @@ fn generate_manifest(
         }
 
         // Determine OOP/IP
-        let (oop_range, ip_range) = if opener.is_ip_vs(&responder) {
-            (responder_range.join(","), opener_range.join(","))
+        let (oop_range, ip_range, oop_pos, ip_pos) = if opener.is_ip_vs(&responder) {
+            (responder_range.join(","), opener_range.join(","), responder.as_str().to_string(), opener.as_str().to_string())
         } else {
-            (opener_range.join(","), responder_range.join(","))
+            (opener_range.join(","), responder_range.join(","), opener.as_str().to_string(), responder.as_str().to_string())
         };
 
         for pot_type in &pot_types {
@@ -129,6 +131,8 @@ fn generate_manifest(
                     ip_range: ip_range.clone(),
                     pot: pot_scaled,
                     stack: stack_scaled,
+                    oop_pos: oop_pos.clone(),
+                    ip_pos: ip_pos.clone(),
                 });
             }
         }
@@ -183,7 +187,7 @@ pub fn run_batch_solve(stack: f64, srp_only: bool, limit: Option<usize>, iterati
 
     for (i, spot) in manifest.iter().enumerate() {
         // 3. Check if already cached
-        if FlopSolution::load_cache(&spot.board, spot.pot, spot.stack).is_some() {
+        if FlopSolution::load_cache(&spot.board, &spot.oop_pos, &spot.ip_pos, spot.pot, spot.stack).is_some() {
             skipped += 1;
             println!(
                 "  [{}/{}] {} {} vs {} ({}) ... {}",
@@ -226,7 +230,9 @@ pub fn run_batch_solve(stack: f64, srp_only: bool, limit: Option<usize>, iterati
             }
         };
 
-        let result = solve_flop(&config);
+        let mut result = solve_flop(&config);
+        result.oop_pos = spot.oop_pos.clone();
+        result.ip_pos = spot.ip_pos.clone();
         result.save_cache();
         solved += 1;
 

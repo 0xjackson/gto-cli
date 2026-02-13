@@ -218,15 +218,22 @@ impl StrategyEngine {
         let board_len = board.len();
         let hero_side = if hero.is_ip_vs(&villain) { "IP" } else { "OOP" };
 
+        // Determine OOP/IP positions for cache key
+        let (oop_pos, ip_pos) = if hero.is_ip_vs(&villain) {
+            (villain, hero)
+        } else {
+            (hero, villain)
+        };
+
         // Derive ranges from preflop solution
         let (oop_range, ip_range) = self.derive_postflop_ranges(hero, villain)?;
         let oop_str = oop_range.join(",");
         let ip_str = ip_range.join(",");
 
         match board_len {
-            6 => self.query_flop(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations),
-            8 => self.query_turn(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations),
-            10 => self.query_river(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations),
+            6 => self.query_flop(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str()),
+            8 => self.query_turn(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str()),
+            10 => self.query_river(hand, hero_side, board, &oop_str, &ip_str, pot, stack, iterations, oop_pos.as_str(), ip_pos.as_str()),
             _ => Err(format!("Invalid board length: {} chars (expected 6, 8, or 10)", board_len)),
         }
     }
@@ -281,16 +288,20 @@ impl StrategyEngine {
         pot: f64,
         stack: f64,
         iterations: usize,
+        oop_pos: &str,
+        ip_pos: &str,
     ) -> Result<StrategyResult, String> {
         // Try cache first (with position info in key)
-        if let Some(solution) = FlopSolution::load_cache(board, pot, stack) {
+        if let Some(solution) = FlopSolution::load_cache(board, oop_pos, ip_pos, pot, stack) {
             return lookup_in_flop_solution(&solution, hand, hero_side);
         }
 
         // Solve on-demand
         eprintln!("  Solving flop {} (this may take 1-4 min)...", board);
         let config = FlopSolverConfig::new(board, oop_range, ip_range, pot, stack, iterations)?;
-        let solution = solve_flop(&config);
+        let mut solution = solve_flop(&config);
+        solution.oop_pos = oop_pos.to_string();
+        solution.ip_pos = ip_pos.to_string();
         solution.save_cache();
 
         lookup_in_flop_solution(&solution, hand, hero_side)
@@ -306,14 +317,18 @@ impl StrategyEngine {
         pot: f64,
         stack: f64,
         iterations: usize,
+        oop_pos: &str,
+        ip_pos: &str,
     ) -> Result<StrategyResult, String> {
-        if let Some(solution) = TurnSolution::load_cache(board, pot, stack) {
+        if let Some(solution) = TurnSolution::load_cache(board, oop_pos, ip_pos, pot, stack) {
             return lookup_in_turn_solution(&solution, hand, hero_side);
         }
 
         eprintln!("  Solving turn {} (this may take 15-45s)...", board);
         let config = TurnSolverConfig::new(board, oop_range, ip_range, pot, stack, iterations)?;
-        let solution = solve_turn(&config);
+        let mut solution = solve_turn(&config);
+        solution.oop_pos = oop_pos.to_string();
+        solution.ip_pos = ip_pos.to_string();
         solution.save_cache();
 
         lookup_in_turn_solution(&solution, hand, hero_side)
@@ -329,14 +344,18 @@ impl StrategyEngine {
         pot: f64,
         stack: f64,
         iterations: usize,
+        oop_pos: &str,
+        ip_pos: &str,
     ) -> Result<StrategyResult, String> {
-        if let Some(solution) = RiverSolution::load_cache(board, pot, stack) {
+        if let Some(solution) = RiverSolution::load_cache(board, oop_pos, ip_pos, pot, stack) {
             return lookup_in_river_solution(&solution, hand, hero_side);
         }
 
         eprintln!("  Solving river {} (this may take 1-5s)...", board);
         let config = RiverSolverConfig::new(board, oop_range, ip_range, pot, stack, iterations)?;
-        let solution = solve_river(&config);
+        let mut solution = solve_river(&config);
+        solution.oop_pos = oop_pos.to_string();
+        solution.ip_pos = ip_pos.to_string();
         solution.save_cache();
 
         lookup_in_river_solution(&solution, hand, hero_side)
