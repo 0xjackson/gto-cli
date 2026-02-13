@@ -240,6 +240,27 @@ enum Commands {
         /// Bet size
         bet: f64,
     },
+    /// Query GTO strategy for a hand — `gto query AhKs BTN [Ks9d4c] [--pot 6] [--stack 97]`
+    Query {
+        /// Your hole cards (e.g., AhKs, QdQc, Td9c)
+        hand: String,
+        /// Your position (UTG, HJ, CO, BTN, SB, BB)
+        position: String,
+        /// Villain position override (default: auto-detect)
+        #[arg(long)]
+        vs: Option<String>,
+        /// Board cards — omit for preflop (e.g., Ks9d4c, Ks9d4c7h)
+        board: Option<String>,
+        /// Pot size in bb (auto-derived from spot if omitted)
+        #[arg(long)]
+        pot: Option<f64>,
+        /// Effective stack in bb
+        #[arg(short, long, default_value = "100")]
+        stack: f64,
+        /// MCCFR iterations for on-demand solving
+        #[arg(short, long, default_value = "500000")]
+        iterations: usize,
+    },
     /// Interactive hand advisor — walk through a poker hand step-by-step
     Play,
     /// Solve GTO strategies using CFR+
@@ -363,7 +384,15 @@ fn validate_position(pos: &str, table_size: &str) -> Result<String, String> {
 
 pub fn run() {
     let cli = Cli::parse();
+    dispatch(cli);
+}
 
+pub fn run_with_args(args: Vec<String>) {
+    let cli = Cli::parse_from(args);
+    dispatch(cli);
+}
+
+fn dispatch(cli: Cli) {
     match cli.command {
         Commands::Range {
             position,
@@ -438,6 +467,15 @@ pub fn run() {
         } => cmd_spr(stack_size, pot_size),
         Commands::Combos { range_str } => cmd_combos(range_str),
         Commands::Bluff { pot, bet } => cmd_bluff(pot, bet),
+        Commands::Query {
+            hand,
+            position,
+            vs,
+            board,
+            pot,
+            stack,
+            iterations,
+        } => cmd_query(hand, position, vs, board, pot, stack, iterations),
         Commands::Play => crate::play::play_command(),
         Commands::Solve { solver } => match solver {
             SolverCommands::Pushfold {
@@ -1629,6 +1667,167 @@ fn cmd_bluff(pot: f64, bet: f64) {
         format!("{:.1}%", be_pct * 100.0).bold()
     );
     println!();
+}
+
+fn cmd_query(
+    hand: String,
+    position: String,
+    vs: Option<String>,
+    board: Option<String>,
+    pot: Option<f64>,
+    stack: f64,
+    iterations: usize,
+) {
+    use crate::preflop_solver::Position;
+    use crate::strategy::{
+        default_villain, detect_street, format_strategy, pretty_board, pretty_hand,
+        PotType, StrategyEngine, StrategySource,
+    };
+
+    let hero = match Position::from_str(&position) {
+        Some(p) => p,
+        None => {
+            print_error(&format!(
+                "Invalid position '{}'. Valid: UTG, HJ, CO, BTN, SB, BB",
+                position
+            ));
+            return;
+        }
+    };
+
+    let villain = match &vs {
+        Some(v) => match Position::from_str(v) {
+            Some(p) => p,
+            None => {
+                print_error(&format!("Invalid villain position: {}", v));
+                return;
+            }
+        },
+        None => default_villain(hero),
+    };
+
+    let mut engine = StrategyEngine::new(stack);
+
+    let hero_side = if hero.is_ip_vs(&villain) { "IP" } else { "OOP" };
+    let villain_str = villain.as_str();
+
+    match &board {
+        None => {
+            // Preflop query
+            if !engine.has_preflop() {
+                print_error(&format!(
+                    "No preflop solution found. Run `gto solve preflop --stack {}` first.",
+                    stack
+                ));
+                return;
+            }
+
+            let vs_pos = if vs.is_some() { Some(villain) } else { None };
+            match engine.query_preflop(&hand_to_canonical(&hand), hero, vs_pos) {
+                Some(result) => {
+                    println!();
+                    println!(
+                        "  {}  {}  {}{}  |  Preflop",
+                        "GTO".bold(),
+                        pretty_hand(&hand).bold(),
+                        position.bold(),
+                        if vs.is_some() {
+                            format!(" vs {}", villain_str)
+                        } else {
+                            String::new()
+                        },
+                    );
+                    println!();
+                    println!("  {}", format_strategy(&result));
+                    println!();
+                }
+                None => {
+                    print_error("Could not find strategy for this hand/position");
+                }
+            }
+        }
+        Some(board_str) => {
+            // Postflop query
+            let street = detect_street(board_str);
+
+            // Auto-derive pot/stack if not specified
+            let (pot_val, stack_val) = match pot {
+                Some(p) => (p, stack),
+                None => PotType::Srp.pot_and_stack(),
+            };
+
+            println!();
+            println!(
+                "  {}  {}  {} vs {}  |  Board: {}  |  {}  |  {}",
+                "GTO".bold(),
+                pretty_hand(&hand).bold(),
+                position.bold(),
+                villain_str,
+                pretty_board(board_str),
+                street,
+                hero_side,
+            );
+
+            match engine.query_postflop(
+                &hand, hero, villain, board_str, pot_val, stack_val, iterations,
+            ) {
+                Ok(result) => {
+                    if result.source == StrategySource::NotInRange {
+                        println!();
+                        println!("  {} is not in the {} range for this spot", hand, hero_side);
+                    } else {
+                        println!();
+                        println!("  {}", format_strategy(&result));
+                    }
+                    println!();
+                }
+                Err(e) => {
+                    println!();
+                    print_error(&e);
+                }
+            }
+        }
+    }
+}
+
+/// Convert specific cards "AhKs" to canonical notation "AKo" for preflop lookup.
+fn hand_to_canonical(hand: &str) -> String {
+    if hand.len() != 4 {
+        return hand.to_string();
+    }
+    let chars: Vec<char> = hand.chars().collect();
+    let r1 = chars[0];
+    let s1 = chars[1];
+    let r2 = chars[2];
+    let s2 = chars[3];
+
+    if r1 == r2 {
+        format!("{}{}", r1, r2)
+    } else if s1 == s2 {
+        // Suited — put higher rank first
+        let (h, l) = if rank_value(r1) >= rank_value(r2) {
+            (r1, r2)
+        } else {
+            (r2, r1)
+        };
+        format!("{}{}s", h, l)
+    } else {
+        // Offsuit — put higher rank first
+        let (h, l) = if rank_value(r1) >= rank_value(r2) {
+            (r1, r2)
+        } else {
+            (r2, r1)
+        };
+        format!("{}{}o", h, l)
+    }
+}
+
+fn rank_value(c: char) -> u8 {
+    match c {
+        '2' => 2, '3' => 3, '4' => 4, '5' => 5, '6' => 6, '7' => 7, '8' => 8,
+        '9' => 9, 'T' => 10, 'J' => 11, 'Q' => 12, 'K' => 13, 'A' => 14,
+        _ => 0,
+    }
 }
 
 fn cmd_solve_pushfold(stack: f64, rake: f64, iterations: usize) {
